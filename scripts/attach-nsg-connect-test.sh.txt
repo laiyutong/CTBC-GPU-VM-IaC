@@ -1,0 +1,635 @@
+#!/usr/bin/env bash
+#
+# [Sanitized example] Logic matches attach-nsg-connect-test.sh; placeholders only — safe for version control.
+# To run: copy to attach-nsg-connect-test.local.sh, fill RG/VM/credentials, chmod +x, execute.
+#
+# Attach a test NSG to each VM's primary NIC, allow SSH/RDP, verify connectivity, then restore/cleanup.
+# Configure via AZURE_VM_NAME / VM_TEST_USER / VM_TEST_PASSWORD / VM_TEST_SSH_KEY_PATH arrays below.
+# See README-attach-nsg-connect-test.md
+#
+# --- How to run ---
+# From project root CTBC_GPU_VM-module:
+#   cd scripts
+#   chmod +x attach-nsg-connect-test.sh   # first time only
+#   ./attach-nsg-connect-test.sh
+#
+# Or from project root:
+#   bash scripts/attach-nsg-connect-test.sh
+#
+# --- Local dependencies (not installed by this script) ---
+# Windows RDP password check: xfreerdp (FreeRDP 3, +auth-only)
+#   macOS: brew install freerdp
+#   Linux: distro package, e.g. sudo apt install freerdp2-x11 (or freerdp3-x11)
+# Linux SSH password check (optional): sshpass or expect
+#   macOS: brew install sshpass
+#   Linux: sudo apt install sshpass
+# macOS timeout helper: brew install coreutils (gtimeout)
+# -------------------------
+
+# =============================================================================
+# Configuration (placeholders; replace before run)
+# =============================================================================
+#
+# All variables are arrays; a single VM still needs a one-element array.
+#
+#   AZURE_VM_NAME[i]           - VM name (public IP queried via az)
+#   VM_TEST_USER[i]            - Login username
+#   VM_TEST_PASSWORD[i]        - Password (Linux password mode / Windows RDP)
+#   VM_TEST_SSH_KEY_PATH[i]    - Linux private key path (not .pub)
+#   VM_TEST_SSH_KEY_SOURCE[i]  - Optional: generate | azure_existing | public_key
+#
+# Linux auth priority: valid VM_TEST_SSH_KEY_PATH -> key; else password; else TCP 22 only.
+# CHANGE_ME_PASSWORD / empty / CHANGE_ME_SSH_KEY skips that auth method.
+#
+# Windows password: terraform output -json windows_vm_admin_passwords
+#
+AZURE_RESOURCE_GROUP="CHANGE_ME_RG"
+
+AZURE_VM_NAME=(
+  "example-gpu-linux-vm-01"
+  "example-gpu-windows-vm-01"
+)
+VM_TEST_USER=(
+  "azureadmin" "azureadmin"
+)
+VM_TEST_PASSWORD=(
+  'CHANGE_ME_PASSWORD'
+  'CHANGE_ME_PASSWORD'
+)
+
+# Linux: ssh_key + public_key in tfvars; Windows entry must be ""
+VM_TEST_SSH_KEY_PATH=(
+  "$HOME/.ssh/id_rsa"
+  ""
+)
+VM_TEST_SSH_KEY_SOURCE=(
+  "public_key"
+  ""
+)
+
+# NSG rule source; * = any (use your IP/32 in production)
+NSG_SOURCE_PREFIX='*'
+
+# After test: restore NIC NSG; delete NSG only if created in this run. Set false to keep.
+NSG_REMOVE_AFTER_TEST=true
+
+# =============================================================================
+
+set -euo pipefail
+
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly NSG_RULE_NAME="allow-mgmt-port"
+
+die() {
+  echo "[$SCRIPT_NAME] ERROR: $*" >&2
+  exit 1
+}
+
+info() { echo "[$SCRIPT_NAME] $*"; }
+
+vm_err() {
+  echo "[$SCRIPT_NAME] [$VM_NAME] ERROR: $*" >&2
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Command not found: $1"
+}
+
+# macOS may lack GNU timeout; try timeout, gtimeout, perl alarm
+cmd_timeout() {
+  local secs="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@"
+  elif command -v perl >/dev/null 2>&1; then
+    perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+  else
+    die "Need a timeout helper: brew install coreutils (gtimeout) or ensure perl is available"
+  fi
+}
+
+RG="$AZURE_RESOURCE_GROUP"
+SOURCE_PREFIX="$NSG_SOURCE_PREFIX"
+NSG_REMOVE_AFTER_TEST="${NSG_REMOVE_AFTER_TEST:-true}"
+
+# Cleanup state (set in run_one_vm worker)
+NIC_ID_FOR_CLEANUP=""
+PREV_NSG_ID_FOR_CLEANUP=""
+NSG_NAME_FOR_CLEANUP=""
+NSG_ATTACHED_FOR_TEST=0
+NSG_CREATED_FOR_TEST=0
+
+[[ -n "$RG" ]] || die "Edit configuration: set AZURE_RESOURCE_GROUP"
+[[ "$RG" != "CHANGE_ME_RG" ]] || die "Replace AZURE_RESOURCE_GROUP with your actual resource group name"
+
+n=${#AZURE_VM_NAME[@]}
+[[ "$n" -ge 1 ]] || die "AZURE_VM_NAME must contain at least one VM name"
+
+nu=${#VM_TEST_USER[@]}
+np=${#VM_TEST_PASSWORD[@]}
+nk=${#VM_TEST_SSH_KEY_PATH[@]}
+ns=${#VM_TEST_SSH_KEY_SOURCE[@]}
+[[ "$nu" == 1 || "$nu" == "$n" ]] || die "VM_TEST_USER must have 1 entry (shared) or $n entries (one per VM)"
+[[ "$np" == 1 || "$np" == "$n" ]] || die "VM_TEST_PASSWORD must have 1 entry (shared) or $n entries (one per VM)"
+[[ "$nk" == 0 || "$nk" == 1 || "$nk" == "$n" ]] || die "VM_TEST_SSH_KEY_PATH must be omitted, 1 entry (shared), or $n entries (one per VM)"
+[[ "$ns" == 0 || "$ns" == 1 || "$ns" == "$n" ]] || die "VM_TEST_SSH_KEY_SOURCE must be omitted, 1 entry (shared), or $n entries (one per VM)"
+
+for vm in "${AZURE_VM_NAME[@]}"; do
+  [[ -n "$vm" ]] || die "AZURE_VM_NAME contains an empty string"
+  [[ "$vm" != "CHANGE_ME_VM" ]] || die "Replace CHANGE_ME_VM in AZURE_VM_NAME with actual VM names"
+done
+
+require_cmd az
+az account show >/dev/null 2>&1 || die "Not logged in to Azure. Run: az login"
+
+ssh_key_source_hint() {
+  local src
+  src="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$src" in
+    generate)
+      echo "Mode=Generate new key pair: save terraform output PEM and set VM_TEST_SSH_KEY_PATH (Azure does not provide private keys)."
+      ;;
+    azure_existing)
+      echo "Mode=Use existing key stored in Azure: set local private key path matching that Azure SSH public key resource."
+      ;;
+    public_key)
+      echo "Mode=Use existing public key: set local private key path for the key pair you uploaded."
+      ;;
+    *)
+      echo "For Linux authentication_type=ssh_key, set VM_TEST_SSH_KEY_PATH or use password mode with VM_TEST_PASSWORD."
+      ;;
+  esac
+}
+
+# SSH private key remote echo OK. 0=ok; 2=path unset; 3=file missing; 4=unreadable; 5=no ssh; 6=key perms
+SSH_KEY_LAST_ERR=""
+ssh_try_key_echo_ok() {
+  local user="$1" host="$2" keypath="$3"
+  local errfile rc
+
+  SSH_KEY_LAST_ERR=""
+  if [[ -z "$keypath" || "$keypath" == "CHANGE_ME_SSH_KEY" ]]; then
+    return 2
+  fi
+  if [[ ! -e "$keypath" ]]; then
+    SSH_KEY_LAST_ERR="Private key file not found: $keypath"
+    return 3
+  fi
+  if [[ ! -f "$keypath" ]]; then
+    SSH_KEY_LAST_ERR="Path is not a regular file: $keypath"
+    return 3
+  fi
+  if [[ ! -r "$keypath" ]]; then
+    SSH_KEY_LAST_ERR="Cannot read private key file: $keypath"
+    return 4
+  fi
+  command -v ssh >/dev/null 2>&1 || { SSH_KEY_LAST_ERR="ssh command not found"; return 5; }
+
+  errfile="$(mktemp)" || { SSH_KEY_LAST_ERR="Cannot create temp file"; return 1; }
+  set +e
+  cmd_timeout 30 ssh -i "$keypath" \
+    -o IdentitiesOnly=yes \
+    -o UserKnownHostsFile=/dev/null \
+    -o StrictHostKeyChecking=no \
+    -o ConnectTimeout=12 \
+    -o BatchMode=yes \
+    -o PreferredAuthentications=publickey \
+    -o PasswordAuthentication=no \
+    -o PubkeyAuthentication=yes \
+    "${user}@${host}" 'echo OK' >"$errfile" 2>&1
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 0 ]]; then
+    rm -f "$errfile"
+    return 0
+  fi
+  SSH_KEY_LAST_ERR="$(tr '\n' ' ' <"$errfile" | sed 's/  */ /g' | head -c 500)"
+  if grep -qi 'UNPROTECTED PRIVATE KEY FILE' "$errfile" 2>/dev/null; then
+    rm -f "$errfile"
+    return 6
+  fi
+  rm -f "$errfile"
+  return 1
+}
+
+report_ssh_key_failure() {
+  local rc="$1" keypath="$2" key_source="$3"
+  case "$rc" in
+    2)
+      vm_err "SSH key auth: VM_TEST_SSH_KEY_PATH not set (or CHANGE_ME_SSH_KEY). $(ssh_key_source_hint "$key_source")"
+      ;;
+    3)
+      vm_err "SSH key auth: ${SSH_KEY_LAST_ERR:-file not found}. $(ssh_key_source_hint "$key_source")"
+      ;;
+    4)
+      vm_err "SSH key auth: ${SSH_KEY_LAST_ERR}. $(ssh_key_source_hint "$key_source")"
+      ;;
+    5)
+      vm_err "SSH key auth: ${SSH_KEY_LAST_ERR}"
+      ;;
+    6)
+      vm_err "SSH key auth: private key permissions too open. Run: chmod 600 \"$keypath\". ${SSH_KEY_LAST_ERR:+ Detail: $SSH_KEY_LAST_ERR}"
+      ;;
+    *)
+      vm_err "SSH key auth: failed (exit $rc). Common: key mismatch, wrong user, or VM allows keys only. ${SSH_KEY_LAST_ERR:+ OpenSSH: $SSH_KEY_LAST_ERR} $(ssh_key_source_hint "$key_source")"
+      ;;
+  esac
+}
+
+probe_tcp() {
+  local host="$1" port="$2"
+  if command -v nc >/dev/null 2>&1; then
+    nc -z -w 10 "$host" "$port"
+    return $?
+  fi
+  cmd_timeout 10 bash -c "echo >/dev/tcp/$host/$port" 2>/dev/null
+}
+
+# SSH password remote echo OK. 0=ok; 2=no sshpass and no expect
+ssh_try_password_echo_ok() {
+  local user="$1" host="$2" pass="$3"
+
+  if command -v sshpass >/dev/null 2>&1; then
+    sshpass -p "$pass" ssh \
+      -o UserKnownHostsFile=/dev/null \
+      -o StrictHostKeyChecking=no \
+      -o ConnectTimeout=12 \
+      -o GSSAPIAuthentication=no \
+      -o PreferredAuthentications=password,keyboard-interactive \
+      -o PubkeyAuthentication=no \
+      -o BatchMode=no \
+      "${user}@${host}" 'echo OK' 2>/dev/null
+    return $?
+  fi
+
+  if command -v expect >/dev/null 2>&1; then
+    local pfile rc
+    pfile="$(mktemp)" || return 2
+    printf '%s' "$pass" > "$pfile"
+    chmod 600 "$pfile" || true
+    export SSH_TEST_USER="$user" SSH_TEST_HOST="$host" SSH_TEST_PASS_FILE="$pfile"
+    cmd_timeout 55 expect <<'EXPECT'
+log_user 0
+set timeout 45
+set fh [open $env(SSH_TEST_PASS_FILE) r]
+fconfigure $fh -translation binary
+set p [read $fh]
+close $fh
+set p [string trimright $p "\n\r"]
+spawn ssh -tt -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o GSSAPIAuthentication=no -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=4 $env(SSH_TEST_USER)@$env(SSH_TEST_HOST) echo OK
+expect {
+  timeout { exit 124 }
+  -re "(?i)(Permission denied|publickey|Connection closed|Too many authentication|no mutual signature|All configured authentication methods failed)" { catch wait; exit 1 }
+  -re "(?i)yes/no/.*\\?" { send "yes\r"; exp_continue }
+  -re "(?i)password:\\s*" { send -- "$p\r"; exp_continue }
+  -re "(?i)password for" { send -- "$p\r"; exp_continue }
+  -re "(?i)Enter passphrase for key" { send -- "$p\r"; exp_continue }
+  -re "(?i).*assword.*:\\s*$" { send -- "$p\r"; exp_continue }
+  eof
+}
+catch wait result
+set ec [lindex $result 3]
+if {$ec eq ""} { set ec 0 }
+exit $ec
+EXPECT
+    rc=$?
+    rm -f "$pfile"
+    unset SSH_TEST_USER SSH_TEST_HOST SSH_TEST_PASS_FILE
+    return "$rc"
+  fi
+
+  return 2
+}
+
+# RDP password auth via xfreerdp. 0=ok; 1=fail; 2=xfreerdp not installed
+RDP_LAST_ERR=""
+rdp_xfreerdp_auth_once() {
+  local host="$1" user="$2" pass="$3" cert_mode="$4" errfile="$5"
+  cmd_timeout 65 xfreerdp /args-from:stdin </dev/null 2>"$errfile" <<EOF
+/v:${host}
+/u:${user}
+/p:${pass}
+/cert:${cert_mode}
+/sec:nla
+/timeout:60000
++auth-only
+EOF
+}
+
+rdp_try_password_auth() {
+  local host="$1" user="$2" pass="$3"
+  local errfile rc
+
+  RDP_LAST_ERR=""
+  if ! command -v xfreerdp >/dev/null 2>&1; then
+    return 2
+  fi
+
+  errfile="$(mktemp)" || return 1
+  set +e
+  rdp_xfreerdp_auth_once "$host" "$user" "$pass" ignore "$errfile"
+  rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    rdp_xfreerdp_auth_once "$host" "$user" "$pass" tofu "$errfile"
+    rc=$?
+  fi
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    RDP_LAST_ERR="$(grep '\[ERROR\]' "$errfile" 2>/dev/null | tail -5 | tr '\n' ' ' | sed 's/  */ /g' | head -c 450)"
+    [[ -z "$RDP_LAST_ERR" ]] && RDP_LAST_ERR="$(tail -3 "$errfile" 2>/dev/null | tr '\n' ' ' | head -c 450)"
+  fi
+  rm -f "$errfile"
+  return "$rc"
+}
+
+rdp_exit_hint() {
+  local rc="$1"
+  case "$rc" in
+    23)
+      echo "Often NLA auth failure or incompatible flags. Verify VM_TEST_PASSWORD via terraform output windows_vm_admin_passwords; use FreeRDP 3 (+auth-only)."
+      ;;
+    131|132)
+      echo "FreeRDP NLA error (131=connect, 132=credentials). Check Windows password and RDP allowed on VM."
+      ;;
+    *)
+      echo "If TCP 3389 succeeded, try Microsoft Remote Desktop manually to verify credentials."
+      ;;
+  esac
+}
+
+restore_nic_nsg_after_test() {
+  local remove
+  remove="$(echo "${NSG_REMOVE_AFTER_TEST:-true}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$remove" == "false" || "$remove" == "0" || "$remove" == "no" ]]; then
+    info "[$VM_NAME] Skipping NSG restore (NSG_REMOVE_AFTER_TEST=$NSG_REMOVE_AFTER_TEST)"
+    return 0
+  fi
+  if [[ "$NSG_ATTACHED_FOR_TEST" -ne 1 || -z "$NIC_ID_FOR_CLEANUP" ]]; then
+    return 0
+  fi
+  if [[ -n "$PREV_NSG_ID_FOR_CLEANUP" && "$PREV_NSG_ID_FOR_CLEANUP" != "null" ]]; then
+    if az network nic update --ids "$NIC_ID_FOR_CLEANUP" --network-security-group "$PREV_NSG_ID_FOR_CLEANUP" --output none 2>/dev/null; then
+      info "[$VM_NAME] Cleanup: restored previous NSG on NIC"
+    else
+      vm_err "Cleanup: failed to restore previous NSG on NIC (check NIC in Azure Portal)"
+      return 1
+    fi
+  else
+    if az network nic update --ids "$NIC_ID_FOR_CLEANUP" --network-security-group "" --output none 2>/dev/null; then
+      info "[$VM_NAME] Cleanup: detached test NSG from NIC (${NSG_NAME_FOR_CLEANUP:-$VM_NAME-nsg})"
+    else
+      vm_err "Cleanup: failed to detach test NSG from NIC (detach ${NSG_NAME_FOR_CLEANUP:-$VM_NAME-nsg} manually in Portal)"
+      return 1
+    fi
+  fi
+  NSG_ATTACHED_FOR_TEST=0
+  return 0
+}
+
+delete_test_nsg_if_created() {
+  local remove nsg_name
+  remove="$(echo "${NSG_REMOVE_AFTER_TEST:-true}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$remove" == "false" || "$remove" == "0" || "$remove" == "no" ]]; then
+    return 0
+  fi
+  if [[ "$NSG_CREATED_FOR_TEST" -ne 1 ]]; then
+    return 0
+  fi
+  nsg_name="${NSG_NAME_FOR_CLEANUP:-${VM_NAME}-nsg}"
+  if az network nsg delete -g "$RG" -n "$nsg_name" --output none 2>/dev/null; then
+    info "[$VM_NAME] Cleanup: deleted NSG created by this run ($nsg_name)"
+    NSG_CREATED_FOR_TEST=0
+    return 0
+  fi
+  vm_err "Cleanup: failed to delete NSG $nsg_name (may still be attached elsewhere; delete in Portal)"
+  return 1
+}
+
+run_one_vm() {
+  local rc=0
+  NIC_ID_FOR_CLEANUP=""
+  PREV_NSG_ID_FOR_CLEANUP=""
+  NSG_NAME_FOR_CLEANUP=""
+  NSG_ATTACHED_FOR_TEST=0
+  NSG_CREATED_FOR_TEST=0
+  _run_one_vm_worker "$@" || rc=$?
+  restore_nic_nsg_after_test || rc=$?
+  delete_test_nsg_if_created || rc=$?
+  return "$rc"
+}
+
+_run_one_vm_worker() {
+  VM_NAME="$1"
+  local effective_user="$2"
+  local effective_pass="$3"
+  local effective_key="$4"
+  local effective_key_source="$5"
+  local CONN_OK=1
+  local NSG_NAME DEST_PORT OSTYPE_RAW LOC NIC_ID PUBLIC_IP NSG_ID
+  local ssh_rc=0 rdp_rc=0 use_key=0 use_pass=0
+
+  NSG_NAME="${VM_NAME}-nsg"
+
+  OSTYPE_RAW="$(az vm show -g "$RG" -n "$VM_NAME" --query "storageProfile.osDisk.osType" -o tsv 2>/dev/null)" || {
+    vm_err "Cannot read VM (check resource group, name, and permissions)"
+    return 1
+  }
+
+  OSTYPE_RAW="$(echo "$OSTYPE_RAW" | tr '[:lower:]' '[:upper:]')"
+  if [[ "$OSTYPE_RAW" != "LINUX" && "$OSTYPE_RAW" != "WINDOWS" ]]; then
+    vm_err "Unsupported osType: $OSTYPE_RAW"
+    return 1
+  fi
+
+  LOC="$(az vm show -g "$RG" -n "$VM_NAME" --query "location" -o tsv)"
+  NIC_ID="$(az vm show -g "$RG" -n "$VM_NAME" --query "networkProfile.networkInterfaces[0].id" -o tsv)"
+  if [[ -z "$NIC_ID" ]]; then
+    vm_err "Primary NIC not found"
+    return 1
+  fi
+
+  PUBLIC_IP="$(az vm list-ip-addresses -g "$RG" -n "$VM_NAME" \
+    --query "[0].virtualMachine.network.publicIpAddresses[0].ipAddress" -o tsv)"
+  if [[ -z "$PUBLIC_IP" || "$PUBLIC_IP" == "null" ]]; then
+    vm_err "No public IP on VM; external connectivity test not possible"
+    return 1
+  fi
+
+  if [[ "$OSTYPE_RAW" == "LINUX" ]]; then
+    DEST_PORT=22
+    if [[ -z "$effective_user" ]]; then
+      vm_err "Linux test requires VM_TEST_USER for this VM"
+      return 1
+    fi
+  else
+    DEST_PORT=3389
+  fi
+
+  info "[$VM_NAME] OS=$OSTYPE_RAW location=$LOC public_ip=$PUBLIC_IP"
+  info "[$VM_NAME] NSG=$NSG_NAME NIC=$NIC_ID"
+
+  NSG_NAME_FOR_CLEANUP="$NSG_NAME"
+  if az network nsg show -g "$RG" -n "$NSG_NAME" >/dev/null 2>&1; then
+    info "[$VM_NAME] NSG already exists (will not delete NSG resource after test)"
+    NSG_CREATED_FOR_TEST=0
+  else
+    az network nsg create -g "$RG" -n "$NSG_NAME" -l "$LOC" --output none
+    NSG_CREATED_FOR_TEST=1
+    info "[$VM_NAME] Created NSG (will delete after test if cleanup enabled)"
+  fi
+
+  if az network nsg rule show -g "$RG" --nsg-name "$NSG_NAME" -n "$NSG_RULE_NAME" >/dev/null 2>&1; then
+    az network nsg rule delete -g "$RG" --nsg-name "$NSG_NAME" -n "$NSG_RULE_NAME" --output none
+  fi
+
+  az network nsg rule create \
+    -g "$RG" \
+    --nsg-name "$NSG_NAME" \
+    -n "$NSG_RULE_NAME" \
+    --priority 100 \
+    --access Allow \
+    --direction Inbound \
+    --protocol Tcp \
+    --source-address-prefixes "$SOURCE_PREFIX" \
+    --source-port-ranges '*' \
+    --destination-address-prefixes '*' \
+    --destination-port-ranges "$DEST_PORT" \
+    --output none
+
+  info "[$VM_NAME] Created/updated rule: TCP $DEST_PORT (source $SOURCE_PREFIX)"
+
+  PREV_NSG_ID_FOR_CLEANUP="$(az network nic show --ids "$NIC_ID" --query "networkSecurityGroup.id" -o tsv 2>/dev/null || true)"
+  NIC_ID_FOR_CLEANUP="$NIC_ID"
+
+  NSG_ID="$(az network nsg show -g "$RG" -n "$NSG_NAME" --query id -o tsv)"
+  az network nic update --ids "$NIC_ID" --network-security-group "$NSG_ID" --output none
+  NSG_ATTACHED_FOR_TEST=1
+  info "[$VM_NAME] Bound NSG to NIC"
+
+  info "[$VM_NAME] Waiting for NSG to apply (~15s)..."
+  sleep 15
+
+  if probe_tcp "$PUBLIC_IP" "$DEST_PORT"; then
+    info "[$VM_NAME] TCP $DEST_PORT reachable"
+    CONN_OK=0
+  else
+    vm_err "TCP $DEST_PORT unreachable (check subnet NSG, VM firewall, and service listening)"
+    return 1
+  fi
+
+  if [[ "$OSTYPE_RAW" == "LINUX" ]]; then
+    use_key=0
+    use_pass=0
+    ssh_rc=0
+    [[ -n "$effective_key" && "$effective_key" != "CHANGE_ME_SSH_KEY" ]] && use_key=1
+    [[ -n "$effective_pass" ]] && use_pass=1
+
+    if ((use_key)); then
+      info "[$VM_NAME] SSH auth: private key path=$effective_key"
+      set +e
+      ssh_try_key_echo_ok "$effective_user" "$PUBLIC_IP" "$effective_key"
+      ssh_rc=$?
+      set -e
+      if [[ "$ssh_rc" -eq 0 ]]; then
+        info "[$VM_NAME] SSH key auth: success (remote echo OK)"
+      else
+        report_ssh_key_failure "$ssh_rc" "$effective_key" "$effective_key_source"
+        return 1
+      fi
+    elif ((use_pass)); then
+      info "[$VM_NAME] SSH auth: password (sshpass or expect)"
+      set +e
+      ssh_try_password_echo_ok "$effective_user" "$PUBLIC_IP" "$effective_pass"
+      ssh_rc=$?
+      set -e
+      if [[ "$ssh_rc" -eq 0 ]]; then
+        info "[$VM_NAME] SSH password auth: success"
+      elif [[ "$ssh_rc" -eq 2 ]]; then
+        info "[$VM_NAME] Skipped SSH password auth (install sshpass or use expect; TCP 22 only)"
+      elif [[ "$ssh_rc" -eq 124 ]]; then
+        vm_err "SSH password auth: expect timed out (124). Try brew install sshpass or set VM_TEST_SSH_KEY_PATH for key auth"
+        return 1
+      else
+        vm_err "SSH password auth: failed (check credentials and sshd; for ssh_key VMs set VM_TEST_SSH_KEY_PATH)"
+        return 1
+      fi
+    else
+      info "[$VM_NAME] Skipped SSH login (no valid VM_TEST_SSH_KEY_PATH or VM_TEST_PASSWORD); TCP 22 only"
+      info "[$VM_NAME] $(ssh_key_source_hint "$effective_key_source")"
+    fi
+  else
+    if [[ -z "$effective_pass" || -z "$effective_user" ]]; then
+      info "[$VM_NAME] Windows: no credentials provided; success = TCP 3389 only"
+    else
+      rdp_rc=0
+      set +e
+      rdp_try_password_auth "$PUBLIC_IP" "$effective_user" "$effective_pass"
+      rdp_rc=$?
+      set -e
+      if [[ "$rdp_rc" -eq 0 ]]; then
+        info "[$VM_NAME] RDP password auth: success (xfreerdp)"
+      elif [[ "$rdp_rc" -eq 2 ]]; then
+        vm_err "RDP password auth: failed (xfreerdp not installed). When password is set, RDP auth is required. Install FreeRDP: macOS brew install freerdp; Linux use distro package. See README-attach-nsg-connect-test.md."
+        return 1
+      else
+        vm_err "RDP password auth: failed (xfreerdp exit ${rdp_rc}). $(rdp_exit_hint "$rdp_rc")${RDP_LAST_ERR:+ Detail: ${RDP_LAST_ERR}}"
+        return 1
+      fi
+    fi
+  fi
+
+  info "[$VM_NAME] Test completed (CONN_OK=$CONN_OK)"
+  return 0
+}
+
+FAILED_VMS=()
+for i in "${!AZURE_VM_NAME[@]}"; do
+  VM_NAME="${AZURE_VM_NAME[$i]}"
+  if ((nu == 1)); then
+    effective_user="${VM_TEST_USER[0]}"
+  else
+    effective_user="${VM_TEST_USER[$i]}"
+  fi
+  if ((np == 1)); then
+    effective_pass="${VM_TEST_PASSWORD[0]}"
+  else
+    effective_pass="${VM_TEST_PASSWORD[$i]}"
+  fi
+  [[ "$effective_pass" == "CHANGE_ME_PASSWORD" ]] && effective_pass=""
+  if ((nk >= 1)); then
+    if ((nk == 1)); then
+      effective_key="${VM_TEST_SSH_KEY_PATH[0]}"
+    else
+      effective_key="${VM_TEST_SSH_KEY_PATH[$i]}"
+    fi
+  else
+    effective_key=""
+  fi
+  [[ "$effective_key" == "CHANGE_ME_SSH_KEY" ]] && effective_key=""
+  if ((ns >= 1)); then
+    if ((ns == 1)); then
+      effective_key_source="${VM_TEST_SSH_KEY_SOURCE[0]}"
+    else
+      effective_key_source="${VM_TEST_SSH_KEY_SOURCE[$i]}"
+    fi
+  else
+    effective_key_source=""
+  fi
+
+  info "========== Start: ${VM_NAME} =========="
+  if run_one_vm "$VM_NAME" "$effective_user" "$effective_pass" "$effective_key" "$effective_key_source"; then
+    info "========== Passed: ${VM_NAME} =========="
+  else
+    FAILED_VMS+=("$VM_NAME")
+    info "========== Failed: ${VM_NAME} =========="
+  fi
+done
+
+if ((${#FAILED_VMS[@]} > 0)); then
+  die "Test failed for VM(s): ${FAILED_VMS[*]}"
+fi
+
+info "All ${#AZURE_VM_NAME[@]} VM(s) passed"
+exit 0

@@ -1,0 +1,25 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# 含密碼或 SSH 金鑰的環境變數檔
+environments/**/terraform.tfvars
+!environments/**/terraform.tfvars.example
+
+# NSG 連線測試腳本（含真實 RG/VM/密碼）；版控請用 *.txt 範例或複製為 .local.* 後填入
+scripts/attach-nsg-connect-test.sh
+scripts/attach-nsg-connect-test.ps1
+scripts/attach-nsg-connect-test.local.sh
+scripts/attach-nsg-connect-test.local.ps1
+
+# 本機私鑰（terraform output / 測試用）
+keys/
+*.pem

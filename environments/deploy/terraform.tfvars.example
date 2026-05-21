@@ -1,0 +1,222 @@
+# =============================================================================
+# 複製本檔為 terraform.tfvars 後填入實際值。
+# 勿將含 admin_password、ssh_public_key 的 terraform.tfvars 提交至版控。
+#
+# 欄位說明：
+#   - 標示「必填」：部署前必須修改
+#   - 標示「選填」：有預設值，與預設相同可刪除該行（建議保留以利對照）
+#   - linux_vms / windows_vms 的 key（如 gpu-linux）為邏輯名稱，僅供 Terraform 識別
+#   - 實際 VM 名稱為 {vm_name}-01、{vm_name}-02…（由 vm_count 決定數量）
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Azure 訂閱與既有網路資源（本專案不建立，僅 data 查詢）
+# -----------------------------------------------------------------------------
+subscription_id = "00000000-0000-0000-0000-000000000000" # 必填：目標 Subscription ID
+
+existing_resource_group_name = "rg-gpu-example"   # 必填：VM 部署所在 Resource Group
+existing_vnet_name           = "vnet-gpu-example" # 必填：既有 VNet 名稱
+existing_vnet_resource_group = "rg-network-example" # 必填：VNet 所在 RG（可與 VM RG 相同）
+existing_subnet_name         = "snet-gpu-workload" # 必填：VM NIC 連接的 Subnet
+
+# 必填：VM、Storage、RSV 等資源部署之 Azure Region（須與 Subnet／VNet 所在 region 一致）
+location = "japaneast"
+
+# 選填：根層級既有備份原則 ID；若設定則不會建立 backup_recovery_vault_mode = shared 的共用 RSV（各組改掛此原則，且須正確填 recovery_vault_name）
+# backup_policy_id = "/subscriptions/.../resourceGroups/.../providers/Microsoft.RecoveryServices/vaults/.../backupPolicies/DefaultPolicy"
+
+# 選填：全環境預設標籤（與各 VM 的 tags 合併）；預設不設任何 tag 請保持 {}
+# default_tags = { env = "prod" }
+default_tags = {}
+
+# -----------------------------------------------------------------------------
+# 開機診斷 Storage（根變數，與 linux_vms / windows_vms 同層）
+# per_vm_stack = 每條 map 各一顆 SA；shared = 全環境一顆共用 SA。
+# -----------------------------------------------------------------------------
+boot_diagnostics_storage_mode                      = "per_vm_stack" # per_vm_stack | shared
+shared_boot_diagnostics_storage_account_sequence = 1              # 僅 shared 時用於共用 SA 序號
+
+# -----------------------------------------------------------------------------
+# 備份 RSV（根變數，與 linux_vms / windows_vms 同層）
+# per_vm_stack = 每條 map 自建 RSV；shared = 全環境一顆共用 RSV（未填根 backup_policy_id 且各組未填 backup_policy_id 時）。
+# -----------------------------------------------------------------------------
+backup_recovery_vault_mode             = "per_vm_stack" # per_vm_stack | shared
+shared_recovery_vault_name             = ""           # 留空則 ctbc-jpe-shared-vm-rsv-XX
+shared_recovery_vault_sequence         = 1
+shared_recovery_vault_resource_group   = null         # 留空 = VM 所在 RG
+
+# -----------------------------------------------------------------------------
+# Linux GPU VM（azurerm_linux_virtual_machine）
+# 可定義多組，每組 key 不可重複
+# -----------------------------------------------------------------------------
+linux_vms = {
+  gpu-linux = {
+    # --- 基本 ---
+    vm_name  = "vm-gpu-linux" # 必填：名稱基底，實際為 vm-gpu-linux-01…
+    vm_count = 1              # 選填，預設 1：建立 VM 數量（1～10）
+    vm_size  = "NV6ads_A10_v5" # 選填，預設 NV6ads_A10_v5：VM SKU（須支援 GPU 若啟用驅動）
+
+    # --- OS 映像（Marketplace）---
+    source_image_publisher = "Canonical"                      # 選填
+    source_image_offer     = "0001-com-ubuntu-server-jammy"   # 選填
+    source_image_sku       = "22_04-lts-gen2"                 # 選填：建議 Gen2
+    source_image_version   = "latest"                         # 選填
+
+    # --- OS 磁碟（隨 VM 建立，非獨立 managed disk）---
+    os_disk_type    = "StandardSSD_LRS" # 選填：如 Premium_LRS、Standard_LRS
+    os_disk_size_gb = 128               # 選填：GB
+
+    # --- Data 磁碟（選用，預設不建立）---
+    data_disk_enabled = false        # 選填：true 時建立並掛載 data_disk_count 顆
+    data_disk_count   = 1            # 選填：每部 VM 幾顆（1～32）
+    data_disk_size_gb = 128          # 選填：每顆大小 GB
+    data_disk_type    = "Standard_LRS" # 選填：如 Premium_LRS
+
+    # --- 登入（Linux）二選一：password 或 ssh_key ---
+
+    # 【模式 A】password
+    # authentication_type     = "password"
+    # admin_username          = "azureadmin"
+    # generate_admin_password = true  # true：自動產生密碼 → terraform output linux_vm_admin_passwords
+    # admin_password        = null    # 或 generate=false 並填入自訂密碼
+
+    # 【模式 B】ssh_key
+    # ssh_public_key_source 對應 Portal「SSH public key source」三選一：
+    #
+    # (1) generate — Generate new key pair
+    # authentication_type   = "ssh_key"
+    # ssh_public_key_source   = "generate"
+    # ssh_key_type            = "RSA"        # RSA 或 Ed25519
+    # ssh_key_pair_name       = "gpu-linux-key" # 選填；留空則 {vm_name}-ssh-key
+    #
+    # (2) azure_existing — Use existing key stored in Azure
+    # authentication_type            = "ssh_key"
+    # ssh_public_key_source          = "azure_existing"
+    # ssh_azure_key_name             = "my-existing-ssh-key"
+    # ssh_azure_key_resource_group   = "rg-keys" # 選填；留空則用 VM 的 RG
+    #
+    # (3) public_key — Use existing public key（貼上公鑰）
+    authentication_type     = "ssh_key"
+    admin_username          = "azureadmin"
+    ssh_public_key_source   = "public_key"
+    ssh_key_type            = "RSA"
+    ssh_key_pair_name       = ""
+    ssh_azure_key_name      = ""
+    ssh_azure_key_resource_group = null
+    ssh_public_key          = "ssh-rsa AAAA... user@host"
+
+    # --- 網路 ---
+    accelerated_networking = true # 選填：NIC 加速網路（SR-IOV），須 SKU 支援
+
+    # Public IP（選用，預設不建立）
+    public_ip_enabled           = false   # 選填：true 時每部 VM 建立一個 Public IP 並綁定 NIC
+    public_ip_sku               = "Standard" # 選填：Standard 或 Basic
+    public_ip_allocation_method = "Static"   # 選填：Static 或 Dynamic
+    # 啟用 Public IP 後可執行：terraform output linux_public_ip_addresses
+
+    # --- GPU ---
+    enable_gpu_driver_extension = true # 選填：NvidiaGpuDriverLinux Extension
+
+    # --- 可用性 ---
+    availability_zone       = ["1"] # 選填：Zone 清單，多部 VM 時輪替
+    enable_availability_set = false   # 選填：true 時須將 availability_zone 設為 []
+
+    # --- 監控與診斷 ---
+    boot_diagnostics_enabled   = true # 選填：啟用開機診斷
+    # boot_diagnostics_storage_account_sequence = 1 # 選填：per_vm_stack 時專用 SA 序號（預設依 map key 排序自動編）；shared 模式時忽略
+    enable_azure_monitor_agent = false # 選填：AzureMonitorLinuxAgent
+
+    # --- 身分與 RBAC ---
+    # identity_type              = null # 選填：SystemAssigned、UserAssigned 等；null 表示不啟用
+    # user_assigned_identity_ids = []   # identity_type 含 UserAssigned 時必填
+    # role_assignments = [
+    #   { scope = "/subscriptions/...", role_definition_name = "Contributor" }
+    # ]
+
+    # --- 自動關機 ---
+    auto_shutdown_enabled  = false # 選填
+    auto_shutdown_time     = "2000" # 選填：HHmm（24 小時制）
+    auto_shutdown_timezone = "UTC"  # 選填
+
+    # --- 備份（預設關閉；backup_enabled = true 時自動建立 RSV + 預設 VM 備份原則）---
+    backup_enabled = false
+    # recovery_vault_name           = "" # 選填；留空則 {vm_name}-rsv
+    # recovery_vault_resource_group = null # 選填；留空則用 existing_resource_group_name
+
+    # --- 標籤 ---
+    tags = {} # 選填：與 default_tags 合併
+  }
+}
+
+# -----------------------------------------------------------------------------
+# Windows GPU VM（azurerm_windows_virtual_machine）
+# 不需要時設為 windows_vms = {} 或整段註解
+# -----------------------------------------------------------------------------
+windows_vms = {
+  gpu-win = {
+    # --- 基本 ---
+    vm_name  = "vm-gpu-win"
+    vm_count = 1
+    vm_size  = "NV6ads_A10_v5"
+
+    # --- OS 映像 ---
+    source_image_publisher = "MicrosoftWindowsDesktop"
+    source_image_offer     = "windows-11"
+    source_image_sku       = "win11-25h2-pro"
+    source_image_version   = "latest"
+
+    # --- OS 磁碟 ---
+    os_disk_type    = "StandardSSD_LRS"
+    os_disk_size_gb = 128
+
+    # --- Data 磁碟 ---
+    data_disk_enabled = false
+    data_disk_count   = 1
+    data_disk_size_gb = 128
+    data_disk_type    = "StandardSSD_LRS"
+
+    # --- 登入（Windows 僅密碼）---
+    admin_username          = "azureadmin"
+    generate_admin_password = true
+    # admin_password        = "YourSecureP@ssw0rd!"
+
+    # --- 網路 ---
+    accelerated_networking = true
+
+    # Public IP（選用，預設不建立）
+    public_ip_enabled           = false
+    public_ip_sku               = "Standard"
+    public_ip_allocation_method = "Static"
+
+    # --- GPU ---
+    enable_gpu_driver_extension = true
+
+    # --- 可用性 ---
+    availability_zone       = ["1"]
+    enable_availability_set = false
+
+    # --- 監控與診斷 ---
+    boot_diagnostics_enabled   = true
+    # boot_diagnostics_storage_account_sequence = 1 # 選填：per_vm_stack 時 Windows 專用 SA 序號
+    enable_azure_monitor_agent = false
+
+    # --- 身分與 RBAC ---
+    # identity_type              = null
+    # user_assigned_identity_ids = []    
+    enable_aad_login           = false # AADLoginForWindows
+
+
+    # --- 自動關機 ---
+    auto_shutdown_enabled  = false
+    auto_shutdown_time     = "2000"
+    auto_shutdown_timezone = "UTC"
+
+    # --- 備份（backup_enabled = true 時自動建立 RSV + 預設 VM 備份原則）---
+    backup_enabled = false
+
+    tags = {}
+  }
+}
+
+# 僅部署 Linux、不要 Windows 時：
+# windows_vms = {}
