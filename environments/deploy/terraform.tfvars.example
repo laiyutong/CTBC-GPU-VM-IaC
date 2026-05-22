@@ -127,7 +127,7 @@ linux_vms = {
     # private_ip_address  = "10.0.1.10" # Static 時必填；須在 Subnet 範圍內且未被占用（目前僅支援 vm_count = 1）
 
     # --- GPU ---
-    enable_gpu_driver_extension = true # 選填：NvidiaGpuDriverLinux Extension
+    enable_gpu_driver_extension = true # 選填，預設 true；設 false 則不安裝 NvidiaGpuDriverLinux Extension
 
     # --- 可用性 ---
     availability_zone       = ["1"] # 選填：Zone 清單，多部 VM 時輪替
@@ -212,7 +212,7 @@ windows_vms = {
     # private_ip_address  = "10.0.1.11"
 
     # --- GPU ---
-    enable_gpu_driver_extension = true
+    enable_gpu_driver_extension = true # 選填，預設 true；設 false 則不安裝 NvidiaGpuDriverWindows Extension
 
     # --- 可用性 ---
     availability_zone       = ["1"]

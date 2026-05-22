@@ -228,7 +228,7 @@ variable "linux_vms" {
     backup_policy_retention_daily_count       = optional(number, 30)
     tags                                      = optional(map(string), {})
   }))
-  description = "Linux GPU VM 部署清單（key 為邏輯名稱）。"
+  description = "Linux GPU VM 部署清單（key 為邏輯名稱）。enable_gpu_driver_extension 預設 true（安裝 Microsoft.HpcCompute / NvidiaGpuDriverLinux）。"
   default     = {}
 }
 
@@ -284,6 +284,6 @@ variable "windows_vms" {
     backup_policy_retention_daily_count       = optional(number, 30)
     tags                                      = optional(map(string), {})
   }))
-  description = "Windows GPU VM 部署清單（key 為邏輯名稱）。"
+  description = "Windows GPU VM 部署清單（key 為邏輯名稱）。enable_gpu_driver_extension 預設 true（安裝 Microsoft.HpcCompute / NvidiaGpuDriverWindows）。"
   default     = {}
 }
