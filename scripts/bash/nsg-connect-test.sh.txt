@@ -1,20 +1,17 @@
 #!/usr/bin/env bash
 #
-# [Sanitized example] Logic matches attach-nsg-connect-test.sh; placeholders only — safe for version control.
-# To run: copy to attach-nsg-connect-test.local.sh, fill RG/VM/credentials, chmod +x, execute.
+# [Sanitized example] Logic matches nsg-connect-test.sh; placeholders only — safe for version control.
+# To run: copy to nsg-connect-test.local.sh, fill RG/VM/credentials, chmod +x, execute.
 #
 # Attach a test NSG to each VM's primary NIC, allow SSH/RDP, verify connectivity, then restore/cleanup.
 # Configure via AZURE_VM_NAME / VM_TEST_USER / VM_TEST_PASSWORD / VM_TEST_SSH_KEY_PATH arrays below.
-# See README-attach-nsg-connect-test.md
+# See scripts/bash/README.md (VM must already have a public IP)
 #
 # --- How to run ---
-# From project root CTBC_GPU_VM-module:
-#   cd scripts
-#   chmod +x attach-nsg-connect-test.sh   # first time only
-#   ./attach-nsg-connect-test.sh
-#
-# Or from project root:
-#   bash scripts/attach-nsg-connect-test.sh
+#   cd scripts/bash
+#   cp nsg-connect-test.sh.txt nsg-connect-test.local.sh
+#   chmod +x nsg-connect-test.local.sh
+#   ./nsg-connect-test.local.sh
 #
 # --- Local dependencies (not installed by this script) ---
 # Windows RDP password check: xfreerdp (FreeRDP 3, +auth-only)
@@ -571,7 +568,7 @@ _run_one_vm_worker() {
       if [[ "$rdp_rc" -eq 0 ]]; then
         info "[$VM_NAME] RDP password auth: success (xfreerdp)"
       elif [[ "$rdp_rc" -eq 2 ]]; then
-        vm_err "RDP password auth: failed (xfreerdp not installed). When password is set, RDP auth is required. Install FreeRDP: macOS brew install freerdp; Linux use distro package. See README-attach-nsg-connect-test.md."
+        vm_err "RDP password auth: failed (xfreerdp not installed). When password is set, RDP auth is required. Install FreeRDP: macOS brew install freerdp; Linux use distro package. See scripts/bash/README.md."
         return 1
       else
         vm_err "RDP password auth: failed (xfreerdp exit ${rdp_rc}). $(rdp_exit_hint "$rdp_rc")${RDP_LAST_ERR:+ Detail: ${RDP_LAST_ERR}}"

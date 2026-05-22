@@ -1,0 +1,836 @@
+#Requires -Version 5.1
+#
+# [Sanitized example] Logic matches public-ip-nsg-connect-test.ps1; placeholders only — safe for version control.
+# To run: copy to public-ip-nsg-connect-test.local.ps1, fill RG/VM/credentials, then execute.
+#
+<#
+.SYNOPSIS
+  Attach temporary Public IP + test NSG, verify SSH/RDP, then remove PIP and restore NSG.
+
+.DESCRIPTION
+  For VMs deployed with public_ip_enabled = false. See scripts/powershell/README.md
+
+.NOTES
+  Windows:
+    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+    .\public-ip-nsg-connect-test.ps1
+
+  Requires: Azure CLI (az login), OpenSSH Client (Linux SSH), FreeRDP (Windows RDP when password set).
+  FreeRDP on Windows: choco install freerdp
+#>
+
+# =============================================================================
+# Configuration (placeholders; replace before run — do not commit real secrets)
+# =============================================================================
+$ResourceGroup = 'CHANGE_ME_RG'
+
+$AZURE_VM_NAME = @(
+    'example-gpu-linux-vm-01'
+    'example-gpu-windows-vm-01'
+)
+$VM_TEST_USER = @(
+    'azureadmin'
+    'azureadmin'
+)
+$VM_TEST_PASSWORD = @(
+    'CHANGE_ME_PASSWORD'
+    'CHANGE_ME_PASSWORD'
+)
+$VM_TEST_SSH_KEY_PATH = @(
+    'CHANGE_ME_SSH_KEY'
+    ''
+)
+$VM_TEST_SSH_KEY_SOURCE = @(
+    'public_key'
+    ''
+)
+
+$NsgSourcePrefix = '*'
+$NsgRemoveAfterTest = $true
+
+$PublicIpSku = 'Standard'              # Standard | Basic
+$PublicIpAllocation = 'Static'         # Static | Dynamic
+$PublicIpZone = '1'                    # Standard: 1|2|3; VM zones override when set
+$PublicIpRemoveAfterTest = $true
+$PublicIpSuffix = '-pip-test'
+
+# =============================================================================
+
+$ErrorActionPreference = 'Stop'
+$script:ScriptName = 'public-ip-nsg-connect-test'
+$script:RuleName = 'allow-mgmt-port'
+$script:RdpLastErr = ''
+
+function Write-Info([string] $Message) {
+    Write-Host "[$($script:ScriptName)] $Message" -ForegroundColor Cyan
+}
+
+function Write-Fail([string] $Message) {
+    Write-Host "[$($script:ScriptName)] ERROR: $Message" -ForegroundColor Red
+    exit 1
+}
+
+function Write-VmFail([string] $VmName, [string] $Message) {
+    Write-Host "[$($script:ScriptName)] [$VmName] ERROR: $Message" -ForegroundColor Red
+}
+
+function Test-Prerequisites {
+    if (-not $ResourceGroup) {
+        Write-Fail 'Edit configuration: set $ResourceGroup'
+    }
+    if ($ResourceGroup -eq 'CHANGE_ME_RG') {
+        Write-Fail 'Replace $ResourceGroup with your actual resource group name'
+    }
+
+    $n = $AZURE_VM_NAME.Count
+    if ($n -lt 1) {
+        Write-Fail '$AZURE_VM_NAME must contain at least one VM name'
+    }
+
+    $nu = $VM_TEST_USER.Count
+    $np = $VM_TEST_PASSWORD.Count
+    $nk = $VM_TEST_SSH_KEY_PATH.Count
+    $ns = $VM_TEST_SSH_KEY_SOURCE.Count
+
+    if ($nu -ne 1 -and $nu -ne $n) {
+        Write-Fail "`$VM_TEST_USER must have 1 entry (shared) or $n entries (one per VM)"
+    }
+    if ($np -ne 1 -and $np -ne $n) {
+        Write-Fail "`$VM_TEST_PASSWORD must have 1 entry (shared) or $n entries (one per VM)"
+    }
+    if ($nk -ne 0 -and $nk -ne 1 -and $nk -ne $n) {
+        Write-Fail "`$VM_TEST_SSH_KEY_PATH must be omitted, 1 entry (shared), or $n entries (one per VM)"
+    }
+    if ($ns -ne 0 -and $ns -ne 1 -and $ns -ne $n) {
+        Write-Fail "`$VM_TEST_SSH_KEY_SOURCE must be omitted, 1 entry (shared), or $n entries (one per VM)"
+    }
+
+    foreach ($vm in $AZURE_VM_NAME) {
+        if (-not $vm) {
+            Write-Fail '$AZURE_VM_NAME contains an empty string'
+        }
+        if ($vm -eq 'CHANGE_ME_VM') {
+            Write-Fail 'Replace CHANGE_ME_VM in $AZURE_VM_NAME with actual VM names'
+        }
+    }
+
+    if ($PublicIpSku -notin @('Standard', 'Basic')) {
+        Write-Fail '$PublicIpSku must be Standard or Basic'
+    }
+    if ($PublicIpAllocation -notin @('Static', 'Dynamic')) {
+        Write-Fail '$PublicIpAllocation must be Static or Dynamic'
+    }
+    if ($PublicIpSku -eq 'Standard' -and $PublicIpZone -notin @('1', '2', '3')) {
+        Write-Fail '$PublicIpZone must be 1, 2, or 3 when $PublicIpSku is Standard'
+    }
+
+    if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+        Write-Fail 'Azure CLI (az) not found. Install Azure CLI and retry.'
+    }
+
+    $null = az account show 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail 'Not logged in to Azure. Run: az login'
+    }
+}
+
+function Get-SshKeySourceHint {
+    param([string] $Source)
+    if (-not $Source) { $Source = '' }
+    switch ($Source.ToLowerInvariant()) {
+        'generate' {
+            return 'Mode=Generate new key pair: save terraform output PEM and set $VM_TEST_SSH_KEY_PATH.'
+        }
+        'azure_existing' {
+            return 'Mode=Use existing key stored in Azure: set local private key path matching that Azure SSH public key.'
+        }
+        'public_key' {
+            return 'Mode=Use existing public key: set local private key path for the key pair you uploaded.'
+        }
+        default {
+            return 'For Linux authentication_type=ssh_key, set $VM_TEST_SSH_KEY_PATH or use password mode with $VM_TEST_PASSWORD.'
+        }
+    }
+}
+
+function Get-RdpExitHint {
+    param([int] $ExitCode)
+    switch ($ExitCode) {
+        23 {
+            return 'Often NLA auth failure or incompatible flags. Verify password via terraform output windows_vm_admin_passwords.'
+        }
+        { $_ -in 131, 132 } {
+            return 'FreeRDP NLA error (131=connect, 132=credentials). Check Windows password and RDP allowed on VM.'
+        }
+        default {
+            return 'If TCP 3389 succeeded, try Microsoft Remote Desktop manually to verify credentials.'
+        }
+    }
+}
+
+function Get-RdpClientPath {
+    $cmd = Get-Command xfreerdp -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $cmd = Get-Command wfreerdp -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    foreach ($path in @(
+            'C:\Program Files\FreeRDP\bin\xfreerdp.exe'
+            'C:\Program Files (x86)\FreeRDP\bin\xfreerdp.exe'
+            'C:\ProgramData\chocolatey\bin\xfreerdp.exe'
+            'C:\ProgramData\chocolatey\bin\wfreerdp.exe'
+        )) {
+        if (Test-Path -LiteralPath $path) { return $path }
+    }
+    return $null
+}
+
+function Invoke-XFreeRdpAuthOnce {
+    param(
+        [string] $HostIp,
+        [string] $User,
+        [string] $Pass,
+        [string] $CertMode,
+        [string] $ErrFile,
+        [string] $RdpClientPath
+    )
+    $rdpArgs = @(
+        "/v:$HostIp"
+        "/u:$User"
+        "/p:$Pass"
+        "/cert:$CertMode"
+        '/sec:nla'
+        '/timeout:60000'
+        '+auth-only'
+    )
+    $prevEa = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $RdpClientPath @rdpArgs 2> $ErrFile | Out-Null
+        return $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $prevEa
+    }
+}
+
+function Test-RdpPasswordAuth {
+    param(
+        [string] $HostIp,
+        [string] $User,
+        [string] $Pass
+    )
+    $script:RdpLastErr = ''
+    $rdpClientPath = Get-RdpClientPath
+    if (-not $rdpClientPath) {
+        return 2
+    }
+    $errFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $rc = Invoke-XFreeRdpAuthOnce -HostIp $HostIp -User $User -Pass $Pass -CertMode 'ignore' -ErrFile $errFile -RdpClientPath $rdpClientPath
+        if ($rc -ne 0) {
+            $rc = Invoke-XFreeRdpAuthOnce -HostIp $HostIp -User $User -Pass $Pass -CertMode 'tofu' -ErrFile $errFile -RdpClientPath $rdpClientPath
+        }
+        if ($rc -ne 0) {
+            $errs = @(Get-Content -LiteralPath $errFile -ErrorAction SilentlyContinue | Where-Object { $_ -match '\[ERROR\]' })
+            $joined = if ($errs.Count -gt 0) {
+                ($errs | Select-Object -Last 5) -join ' '
+            }
+            else {
+                (Get-Content -LiteralPath $errFile -ErrorAction SilentlyContinue | Select-Object -Last 3) -join ' '
+            }
+            if ($joined.Length -gt 450) {
+                $joined = $joined.Substring(0, 450)
+            }
+            $script:RdpLastErr = $joined
+        }
+        return $rc
+    }
+    finally {
+        Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-SshKeyEchoOk {
+    param(
+        [string] $User,
+        [string] $HostIp,
+        [string] $KeyPath
+    )
+    if ([string]::IsNullOrWhiteSpace($KeyPath) -or $KeyPath -eq 'CHANGE_ME_SSH_KEY') {
+        return @{ Ok = $false; Code = 2; Message = '$VM_TEST_SSH_KEY_PATH is not set' }
+    }
+    if (-not (Test-Path -LiteralPath $KeyPath -PathType Leaf)) {
+        return @{ Ok = $false; Code = 3; Message = "Private key file not found: $KeyPath" }
+    }
+    if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
+        return @{ Ok = $false; Code = 5; Message = 'ssh not found (enable OpenSSH Client on Windows 10+)' }
+    }
+
+    $knownHosts = Join-Path $env:TEMP ("public-ip-nsg-ssh-kh-{0}" -f [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType File -Path $knownHosts -Force | Out-Null
+    $prevEa = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & ssh -i $KeyPath `
+            -o IdentitiesOnly=yes `
+            -o StrictHostKeyChecking=accept-new `
+            -o "UserKnownHostsFile=$knownHosts" `
+            -o ConnectTimeout=12 `
+            -o BatchMode=yes `
+            -o LogLevel=ERROR `
+            -o PreferredAuthentications=publickey `
+            -o PasswordAuthentication=no `
+            "${User}@${HostIp}" 'echo OK' 2>&1
+        $exit = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $prevEa
+        Remove-Item -LiteralPath $knownHosts -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($exit -eq 0) {
+        return @{ Ok = $true; Code = 0; Message = '' }
+    }
+
+    $text = (($out | ForEach-Object { "$_" }) -join ' ').Trim()
+    $text = [regex]::Replace($text, 'Warning: Permanently added[^\r\n]*', '').Trim()
+    if ($text -match 'UNPROTECTED PRIVATE KEY FILE') {
+        return @{
+            Ok      = $false
+            Code    = 6
+            Message = "Private key permissions too open. Run: icacls `"$KeyPath`" /inheritance:r /grant:r `"$($env:USERNAME):(R)`""
+        }
+    }
+    if (-not $text) {
+        $text = "ssh exited with code $exit (try manually: ssh -i `"$KeyPath`" ${User}@${HostIp})"
+    }
+    if ($text.Length -gt 400) {
+        $text = $text.Substring(0, 400)
+    }
+    return @{ Ok = $false; Code = 1; Message = $text }
+}
+
+function Write-SshKeyFailure {
+    param(
+        [string] $VmName,
+        [hashtable] $Result,
+        [string] $KeySource
+    )
+    $hint = Get-SshKeySourceHint -Source $KeySource
+    switch ($Result.Code) {
+        2 { Write-VmFail $VmName "SSH key auth: `$VM_TEST_SSH_KEY_PATH not set (or CHANGE_ME_SSH_KEY). $hint" }
+        3 { Write-VmFail $VmName "SSH key auth: $($Result.Message). $hint" }
+        5 { Write-VmFail $VmName "SSH key auth: $($Result.Message)" }
+        6 { Write-VmFail $VmName "SSH key auth: $($Result.Message)" }
+        default { Write-VmFail $VmName "SSH key auth: failed (code $($Result.Code)). $($Result.Message) $hint" }
+    }
+}
+
+function Get-PublicIpZoneForVm {
+    param([string] $VmName)
+    $vmZone = az vm show -g $ResourceGroup -n $VmName --query 'zones[0]' -o tsv 2>$null
+    if ($vmZone -and $vmZone -ne 'null') {
+        return $vmZone
+    }
+    if ($PublicIpZone) {
+        return $PublicIpZone
+    }
+    return '1'
+}
+
+function Wait-PublicIpAddress {
+    param([string] $PipName)
+    for ($i = 1; $i -le 24; $i++) {
+        $ip = az network public-ip show -g $ResourceGroup -n $PipName --query ipAddress -o tsv 2>$null
+        if ($ip -and $ip -ne 'null') {
+            return $ip
+        }
+        Start-Sleep -Seconds 5
+    }
+    return $null
+}
+
+function Ensure-PublicIpForVm {
+    param(
+        [string] $VmName,
+        [string] $Location,
+        [string] $NicId
+    )
+
+    $prevPipId = az network nic show --ids $NicId --query 'ipConfigurations[0].publicIPAddress.id' -o tsv 2>$null
+    if ($prevPipId -and $prevPipId -ne 'null') {
+        $publicIp = az network public-ip show --ids $prevPipId --query ipAddress -o tsv 2>$null
+        if (-not $publicIp -or $publicIp -eq 'null') {
+            $publicIp = az vm list-ip-addresses -g $ResourceGroup -n $VmName `
+                --query '[0].virtualMachine.network.publicIpAddresses[0].ipAddress' -o tsv 2>$null
+        }
+        if ($publicIp -and $publicIp -ne 'null') {
+            Write-Info "[$VmName] Using existing public IP: $publicIp (will not delete after test)"
+            return @{
+                PublicIp       = $publicIp
+                PipCreated     = $false
+                PipName        = $null
+                NicName        = $null
+                IpConfigName   = $null
+            }
+        }
+        Write-VmFail $VmName 'NIC has public IP resource but address is not available yet'
+        return $null
+    }
+
+    $ipConfigName = az network nic show --ids $NicId --query 'ipConfigurations[0].name' -o tsv
+    $nicName = az network nic show --ids $NicId --query 'name' -o tsv
+    if (-not $ipConfigName -or -not $nicName) {
+        Write-VmFail $VmName 'Cannot read NIC ipConfiguration name'
+        return $null
+    }
+
+    $pipName = "$VmName$PublicIpSuffix"
+    $pipZone = $null
+    $zoneArgs = @()
+    if ($PublicIpSku -eq 'Standard') {
+        $pipZone = Get-PublicIpZoneForVm -VmName $VmName
+        $zoneArgs = @('--zone', $pipZone)
+    }
+
+    if ($pipZone) {
+        Write-Info "[$VmName] Creating temporary public IP: $pipName (sku=$PublicIpSku allocation=$PublicIpAllocation zone=$pipZone)"
+    }
+    else {
+        Write-Info "[$VmName] Creating temporary public IP: $pipName (sku=$PublicIpSku allocation=$PublicIpAllocation)"
+    }
+
+    $null = az network public-ip show -g $ResourceGroup -n $pipName 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        $createArgs = @(
+            'network', 'public-ip', 'create',
+            '-g', $ResourceGroup,
+            '-n', $pipName,
+            '-l', $Location,
+            '--sku', $PublicIpSku,
+            '--allocation-method', $PublicIpAllocation,
+            '--output', 'none'
+        ) + $zoneArgs
+        & az @createArgs
+        if ($LASTEXITCODE -ne 0) {
+            Write-VmFail $VmName "Failed to create public IP $pipName"
+            return $null
+        }
+        Write-Info "[$VmName] Created public IP resource $pipName"
+    }
+    else {
+        Write-Info "[$VmName] Public IP resource $pipName already exists; will attach and delete after test if cleanup enabled"
+    }
+
+    az network nic ip-config update `
+        -g $ResourceGroup `
+        --nic-name $nicName `
+        --name $ipConfigName `
+        --public-ip-address $pipName `
+        --output none
+    if ($LASTEXITCODE -ne 0) {
+        Write-VmFail $VmName 'Failed to bind public IP to NIC'
+        return $null
+    }
+    Write-Info "[$VmName] Bound public IP to NIC ip-config $ipConfigName"
+
+    Write-Info "[$VmName] Waiting for public IP address to be assigned..."
+    $publicIp = Wait-PublicIpAddress -PipName $pipName
+    if (-not $publicIp) {
+        Write-VmFail $VmName "Timed out waiting for public IP address on $pipName"
+        return $null
+    }
+    Write-Info "[$VmName] Public IP ready: $publicIp"
+
+    return @{
+        PublicIp     = $publicIp
+        PipCreated   = $true
+        PipName      = $pipName
+        NicName      = $nicName
+        IpConfigName = $ipConfigName
+    }
+}
+
+function Restore-NicNsgAfterTest {
+    param(
+        [string] $VmName,
+        [string] $NicId,
+        [string] $PrevNsgId,
+        [bool] $WasAttached
+    )
+    if (-not $NsgRemoveAfterTest) {
+        Write-Info "[$VmName] Skipping NSG restore (`$NsgRemoveAfterTest = `$false)"
+        return $true
+    }
+    if (-not $WasAttached -or -not $NicId) {
+        return $true
+    }
+    if ($PrevNsgId -and $PrevNsgId -ne 'null') {
+        az network nic update --ids $NicId --network-security-group $PrevNsgId --output none
+        if ($LASTEXITCODE -ne 0) {
+            Write-VmFail $VmName 'Cleanup: failed to restore previous NSG on NIC'
+            return $false
+        }
+        Write-Info "[$VmName] Cleanup: restored previous NSG on NIC"
+    }
+    else {
+        az network nic update --ids $NicId --set networkSecurityGroup=null --output none
+        if ($LASTEXITCODE -ne 0) {
+            Write-VmFail $VmName 'Cleanup: failed to detach test NSG from NIC'
+            return $false
+        }
+        Write-Info "[$VmName] Cleanup: detached test NSG from NIC"
+    }
+    return $true
+}
+
+function Remove-TestNsgIfCreated {
+    param(
+        [string] $VmName,
+        [string] $NsgName,
+        [bool] $ShouldDelete
+    )
+    if (-not $NsgRemoveAfterTest -or -not $ShouldDelete) {
+        return $true
+    }
+    az network nsg delete -g $ResourceGroup -n $NsgName --output none 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-VmFail $VmName "Cleanup: failed to delete NSG $NsgName"
+        return $false
+    }
+    Write-Info "[$VmName] Cleanup: deleted test NSG ($NsgName)"
+    return $true
+}
+
+function Remove-PublicIpAfterTest {
+    param(
+        [string] $VmName,
+        [bool] $PipCreated,
+        [string] $PipName,
+        [string] $NicName,
+        [string] $IpConfigName
+    )
+    if (-not $PublicIpRemoveAfterTest) {
+        Write-Info "[$VmName] Skipping public IP cleanup (`$PublicIpRemoveAfterTest = `$false)"
+        return $true
+    }
+    if (-not $PipCreated) {
+        return $true
+    }
+    if (-not $NicName -or -not $IpConfigName) {
+        Write-VmFail $VmName 'Cleanup: missing NIC metadata for public IP detach'
+        return $false
+    }
+
+    az network nic ip-config update `
+        -g $ResourceGroup `
+        --nic-name $NicName `
+        --name $IpConfigName `
+        --set publicIPAddress=null `
+        --output none
+    if ($LASTEXITCODE -ne 0) {
+        Write-VmFail $VmName 'Cleanup: failed to detach public IP from NIC (check Portal)'
+        return $false
+    }
+    Write-Info "[$VmName] Cleanup: detached temporary public IP from NIC"
+
+    if ($PipName) {
+        az network public-ip delete -g $ResourceGroup -n $PipName --output none 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-VmFail $VmName "Cleanup: failed to delete public IP $PipName (delete manually in Portal)"
+            return $false
+        }
+        Write-Info "[$VmName] Cleanup: deleted temporary public IP ($PipName)"
+    }
+    return $true
+}
+
+function Invoke-OneVmCleanup {
+    param(
+        [string] $VmName,
+        [string] $NicId,
+        [string] $PrevNsgId,
+        [bool] $NsgAttached,
+        [bool] $NsgShouldDelete,
+        [string] $NsgName,
+        [bool] $PipCreated,
+        [string] $PipName,
+        [string] $NicName,
+        [string] $IpConfigName
+    )
+    $cleanupOk = $true
+    if (-not (Restore-NicNsgAfterTest -VmName $VmName -NicId $NicId -PrevNsgId $PrevNsgId -WasAttached $NsgAttached)) {
+        $cleanupOk = $false
+    }
+    if (-not (Remove-TestNsgIfCreated -VmName $VmName -NsgName $NsgName -ShouldDelete $NsgShouldDelete)) {
+        $cleanupOk = $false
+    }
+    if (-not (Remove-PublicIpAfterTest -VmName $VmName -PipCreated $PipCreated -PipName $PipName `
+            -NicName $NicName -IpConfigName $IpConfigName)) {
+        $cleanupOk = $false
+    }
+    return $cleanupOk
+}
+
+function Invoke-OneVm {
+    param(
+        [Parameter(Mandatory)][string] $VmName,
+        [Parameter(Mandatory)][string] $EffUser,
+        [string] $EffPass,
+        [string] $EffKeyPath,
+        [string] $EffKeySource
+    )
+
+    $NsgName = "$VmName-nsg"
+    $nicId = $null
+    $prevNsgId = $null
+    $nsgAttached = $false
+    $nsgShouldDelete = $false
+    $pipCreated = $false
+    $pipName = $null
+    $nicNameForPip = $null
+    $ipConfigForPip = $null
+    $publicIp = $null
+    $testOk = $false
+
+    try {
+        $osType = az vm show -g $ResourceGroup -n $VmName --query 'storageProfile.osDisk.osType' -o tsv
+        if ($LASTEXITCODE -ne 0) {
+            Write-VmFail $VmName 'Cannot read VM (check resource group, name, and permissions)'
+            return $false
+        }
+        $osType = $osType.ToUpperInvariant()
+        if ($osType -notin @('LINUX', 'WINDOWS')) {
+            Write-VmFail $VmName "Unsupported osType: $osType"
+            return $false
+        }
+
+        $location = az vm show -g $ResourceGroup -n $VmName --query 'location' -o tsv
+        $nicId = az vm show -g $ResourceGroup -n $VmName --query 'networkProfile.networkInterfaces[0].id' -o tsv
+        if (-not $nicId) {
+            Write-VmFail $VmName 'Primary NIC not found'
+            return $false
+        }
+
+        $pipResult = Ensure-PublicIpForVm -VmName $VmName -Location $location -NicId $nicId
+        if (-not $pipResult) {
+            return $false
+        }
+        $publicIp = $pipResult.PublicIp
+        $pipCreated = $pipResult.PipCreated
+        $pipName = $pipResult.PipName
+        $nicNameForPip = $pipResult.NicName
+        $ipConfigForPip = $pipResult.IpConfigName
+
+        $destPort = if ($osType -eq 'LINUX') { 22 } else { 3389 }
+        if ($osType -eq 'LINUX' -and -not $EffUser) {
+            Write-VmFail $VmName 'Linux test requires $VM_TEST_USER for this VM'
+            return $false
+        }
+
+        Write-Info "[$VmName] OS=$osType location=$location public_ip=$publicIp"
+        Write-Info "[$VmName] NSG=$NsgName NIC=$nicId"
+
+        $prevNsgId = az network nic show --ids $nicId --query 'networkSecurityGroup.id' -o tsv 2>$null
+        $hadNoNsg = (-not $prevNsgId) -or ($prevNsgId -eq 'null')
+
+        $null = az network nsg show -g $ResourceGroup -n $NsgName 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            az network nsg create -g $ResourceGroup -n $NsgName -l $location --output none
+            $nsgShouldDelete = $true
+            Write-Info "[$VmName] Created NSG (will delete after test if cleanup enabled)"
+        }
+        elseif ($hadNoNsg) {
+            $nsgShouldDelete = $true
+            Write-Info "[$VmName] NSG already exists; NIC had no NSG (will delete test NSG after test if cleanup enabled)"
+        }
+        else {
+            Write-Info "[$VmName] NSG already exists; NIC had another NSG (will not delete NSG resource after test)"
+        }
+
+        $null = az network nsg rule show -g $ResourceGroup --nsg-name $NsgName -n $script:RuleName 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            az network nsg rule delete -g $ResourceGroup --nsg-name $NsgName -n $script:RuleName --output none
+        }
+
+        az network nsg rule create `
+            -g $ResourceGroup `
+            --nsg-name $NsgName `
+            -n $script:RuleName `
+            --priority 100 `
+            --access Allow `
+            --direction Inbound `
+            --protocol Tcp `
+            --source-address-prefixes $NsgSourcePrefix `
+            --source-port-ranges '*' `
+            --destination-address-prefixes '*' `
+            --destination-port-ranges $destPort `
+            --output none
+
+        Write-Info "[$VmName] Created/updated rule: TCP $destPort (source $NsgSourcePrefix)"
+
+        $nsgId = az network nsg show -g $ResourceGroup -n $NsgName --query id -o tsv
+        az network nic update --ids $nicId --network-security-group $nsgId --output none
+        $nsgAttached = $true
+        Write-Info "[$VmName] Bound NSG to NIC"
+
+        Write-Info "[$VmName] Waiting for NSG and public IP to apply (~20s)..."
+        Start-Sleep -Seconds 20
+
+        try {
+            $tcp = Test-NetConnection -ComputerName $publicIp -Port $destPort -WarningAction SilentlyContinue
+            if (-not $tcp.TcpTestSucceeded) {
+                Write-VmFail $VmName "TCP $destPort unreachable (check subnet NSG, VM firewall, and service listening)"
+                return $false
+            }
+            Write-Info "[$VmName] TCP $destPort reachable"
+        }
+        catch {
+            Write-VmFail $VmName "Connectivity test exception: $_"
+            return $false
+        }
+
+        if ($osType -eq 'LINUX') {
+            $useKey = -not [string]::IsNullOrWhiteSpace($EffKeyPath) -and $EffKeyPath -ne 'CHANGE_ME_SSH_KEY'
+            $usePass = -not [string]::IsNullOrWhiteSpace($EffPass)
+
+            if ($useKey) {
+                Write-Info "[$VmName] SSH auth: private key path=$EffKeyPath"
+                $keyResult = Test-SshKeyEchoOk -User $EffUser -HostIp $publicIp -KeyPath $EffKeyPath
+                if ($keyResult.Ok) {
+                    Write-Info "[$VmName] SSH key auth: success (remote echo OK)"
+                }
+                else {
+                    Write-SshKeyFailure -VmName $VmName -Result $keyResult -KeySource $EffKeySource
+                    return $false
+                }
+            }
+            elseif ($usePass) {
+                Write-Info "[$VmName] SSH auth: password (requires sshpass)"
+                if (Get-Command sshpass -ErrorAction SilentlyContinue) {
+                    $env:SSHPASS = $EffPass
+                    sshpass -e ssh -o UserKnownHostsFile=NUL -o StrictHostKeyChecking=no `
+                        -o ConnectTimeout=15 -o BatchMode=no `
+                        -o PubkeyAuthentication=no `
+                        "${EffUser}@${publicIp}" 'echo OK' 2>$null
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Info "[$VmName] SSH password auth: success"
+                    }
+                    else {
+                        Write-VmFail $VmName 'SSH password auth: failed (check credentials; for ssh_key VMs set $VM_TEST_SSH_KEY_PATH)'
+                        return $false
+                    }
+                }
+                else {
+                    Write-Info "[$VmName] Skipped SSH password auth (install sshpass or use $VM_TEST_SSH_KEY_PATH); TCP 22 only"
+                }
+            }
+            else {
+                Write-Info "[$VmName] Skipped SSH login (no valid $VM_TEST_SSH_KEY_PATH or $VM_TEST_PASSWORD); TCP 22 only"
+                Write-Info "[$VmName] $(Get-SshKeySourceHint -Source $EffKeySource)"
+            }
+        }
+        else {
+            if ([string]::IsNullOrWhiteSpace($EffPass) -or [string]::IsNullOrWhiteSpace($EffUser)) {
+                Write-Info "[$VmName] Windows: no credentials provided; success = TCP 3389 only"
+            }
+            else {
+                $rdpClientPath = Get-RdpClientPath
+                $prevEa = $ErrorActionPreference
+                $ErrorActionPreference = 'Continue'
+                try {
+                    $rdpRc = Test-RdpPasswordAuth -HostIp $publicIp -User $EffUser -Pass $EffPass
+                }
+                finally {
+                    $ErrorActionPreference = $prevEa
+                }
+                $rdpClient = if ($rdpClientPath) { Split-Path -Leaf $rdpClientPath } else { 'freerdp' }
+                if ($rdpRc -eq 0) {
+                    Write-Info "[$VmName] RDP password auth: success ($rdpClient)"
+                }
+                elseif ($rdpRc -eq 2) {
+                    Write-VmFail $VmName 'RDP password auth: failed (FreeRDP not installed). Windows: choco install freerdp'
+                    return $false
+                }
+                else {
+                    $detail = if ($script:RdpLastErr) { " Detail: $($script:RdpLastErr)" } else { '' }
+                    Write-VmFail $VmName "RDP password auth: failed ($rdpClient exit $rdpRc). $(Get-RdpExitHint -ExitCode $rdpRc)$detail"
+                    return $false
+                }
+            }
+        }
+
+        Write-Info "[$VmName] Test completed"
+        $testOk = $true
+    }
+    finally {
+        if (-not (Invoke-OneVmCleanup -VmName $VmName -NicId $nicId -PrevNsgId $prevNsgId `
+                -NsgAttached $nsgAttached -NsgShouldDelete $nsgShouldDelete -NsgName $NsgName `
+                -PipCreated $pipCreated -PipName $pipName -NicName $nicNameForPip -IpConfigName $ipConfigForPip)) {
+            $testOk = $false
+        }
+    }
+    return $testOk
+}
+
+function Get-EffectiveVmSettings {
+    param([int] $Index)
+
+    $effUser = if ($script:UserCount -eq 1) { $VM_TEST_USER[0] } else { $VM_TEST_USER[$Index] }
+    $effPass = if ($script:PassCount -eq 1) { $VM_TEST_PASSWORD[0] } else { $VM_TEST_PASSWORD[$Index] }
+    if ($effPass -eq 'CHANGE_ME_PASSWORD') { $effPass = $null }
+
+    if ($script:KeyPathCount -ge 1) {
+        $effKey = if ($script:KeyPathCount -eq 1) { $VM_TEST_SSH_KEY_PATH[0] } else { $VM_TEST_SSH_KEY_PATH[$Index] }
+    }
+    else {
+        $effKey = ''
+    }
+    if ($effKey -eq 'CHANGE_ME_SSH_KEY') { $effKey = '' }
+
+    if ($script:KeySourceCount -ge 1) {
+        $effKeySrc = if ($script:KeySourceCount -eq 1) { $VM_TEST_SSH_KEY_SOURCE[0] } else { $VM_TEST_SSH_KEY_SOURCE[$Index] }
+    }
+    else {
+        $effKeySrc = ''
+    }
+
+    return @{
+        User      = $effUser
+        Password  = $effPass
+        KeyPath   = $effKey
+        KeySource = $effKeySrc
+    }
+}
+
+# --- Main ---
+Test-Prerequisites
+
+$script:UserCount = $VM_TEST_USER.Count
+$script:PassCount = $VM_TEST_PASSWORD.Count
+$script:KeyPathCount = $VM_TEST_SSH_KEY_PATH.Count
+$script:KeySourceCount = $VM_TEST_SSH_KEY_SOURCE.Count
+$n = $AZURE_VM_NAME.Count
+
+$failed = @()
+for ($i = 0; $i -lt $n; $i++) {
+    $vn = $AZURE_VM_NAME[$i]
+    $settings = Get-EffectiveVmSettings -Index $i
+
+    Write-Info "========== Start: $vn =========="
+    if (Invoke-OneVm -VmName $vn -EffUser $settings.User -EffPass $settings.Password `
+            -EffKeyPath $settings.KeyPath -EffKeySource $settings.KeySource) {
+        Write-Info "========== Passed: $vn =========="
+    }
+    else {
+        $failed += $vn
+        Write-Info "========== Failed: $vn =========="
+    }
+}
+
+if ($failed.Count -gt 0) {
+    Write-Fail "Test failed for VM(s): $($failed -join ', ')"
+}
+
+Write-Info "All $n VM(s) passed"
+exit 0

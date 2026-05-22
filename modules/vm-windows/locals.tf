@@ -24,7 +24,9 @@ locals {
     length(trimspace(var.recovery_vault_name)) > 0 ? trimspace(var.recovery_vault_name) : "${replace(lower(var.vm_name), "_", "-")}-rsv"
   ) : trimspace(var.recovery_vault_name)
 
-  backup_policy_name_effective = "${local.recovery_vault_name_effective}-vm-policy"
+  backup_policy_name_effective = (
+    length(trimspace(var.backup_policy_name)) > 0 ? trimspace(var.backup_policy_name) : "${local.recovery_vault_name_effective}-vm-policy"
+  )
 
   effective_backup_policy_id = local.manage_backup_in_module ? azurerm_backup_policy_vm.main[0].id : var.backup_policy_id
 
@@ -32,6 +34,18 @@ locals {
 
   vm_names = [
     for i in range(var.vm_count) : format("%s-%02d", var.vm_name, i + 1)
+  ]
+
+  public_ip_names = [
+    for i in range(var.vm_count) : (
+      length(trimspace(var.public_ip_name)) > 0 ? trimspace(var.public_ip_name) : "${local.vm_names[i]}-pip"
+    )
+  ]
+
+  nic_names = [
+    for i in range(var.vm_count) : (
+      length(trimspace(var.nic_name)) > 0 ? trimspace(var.nic_name) : "${local.vm_names[i]}-nic"
+    )
   ]
 
   effective_availability_zones = [

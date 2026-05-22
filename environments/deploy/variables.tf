@@ -109,6 +109,66 @@ variable "shared_recovery_vault_resource_group" {
   nullable    = true
 }
 
+variable "shared_backup_policy_name" {
+  type        = string
+  description = "backup_recovery_vault_mode = shared 時自建共用 VM 備份原則名稱；留空則為 {共用 RSV 名稱}-vm-policy。"
+  default     = ""
+  nullable    = false
+}
+
+variable "shared_backup_policy_frequency" {
+  type        = string
+  description = "backup_recovery_vault_mode = shared 且由 deploy 自建共用備份原則時之排程頻率：Daily 或 Weekly。"
+  default     = "Daily"
+  nullable    = false
+
+  validation {
+    condition     = contains(["Daily", "Weekly"], var.shared_backup_policy_frequency)
+    error_message = "shared_backup_policy_frequency 必須為 Daily 或 Weekly。"
+  }
+}
+
+variable "shared_backup_policy_time" {
+  type        = string
+  description = "共用備份原則執行時間（HH:mm）。"
+  default     = "23:00"
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^([01][0-9]|2[0-3]):[0-5][0-9]$", var.shared_backup_policy_time))
+    error_message = "shared_backup_policy_time 須為 HH:mm 格式（00:00～23:59）。"
+  }
+}
+
+variable "shared_backup_policy_weekdays" {
+  type        = list(string)
+  description = "shared_backup_policy_frequency = Weekly 時的備份星期。"
+  default     = ["Sunday"]
+  nullable    = false
+
+  validation {
+    condition = alltrue([
+      for d in var.shared_backup_policy_weekdays : contains(
+        ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+        d
+      )
+    ])
+    error_message = "shared_backup_policy_weekdays 須為 Sunday～Saturday 其中之一或多個。"
+  }
+}
+
+variable "shared_backup_policy_retention_daily_count" {
+  type        = number
+  description = "共用備份原則之每日還原點保留天數。"
+  default     = 30
+  nullable    = false
+
+  validation {
+    condition     = var.shared_backup_policy_retention_daily_count >= 1 && var.shared_backup_policy_retention_daily_count <= 9999
+    error_message = "shared_backup_policy_retention_daily_count 必須介於 1 與 9999。"
+  }
+}
+
 variable "linux_vms" {
   type = map(object({
     vm_name                      = string
@@ -123,8 +183,12 @@ variable "linux_vms" {
     enable_gpu_driver_extension  = optional(bool, true)
     accelerated_networking       = optional(bool, true)
     public_ip_enabled            = optional(bool, false)
+    public_ip_name               = optional(string, "")
+    nic_name                     = optional(string, "")
     public_ip_sku                = optional(string, "Standard")
     public_ip_allocation_method  = optional(string, "Static")
+    private_ip_allocation        = optional(string, "Dynamic")
+    private_ip_address           = optional(string)
     data_disk_enabled            = optional(bool, false)
     data_disk_count              = optional(number, 1)
     data_disk_size_gb            = optional(number, 128)
@@ -150,7 +214,6 @@ variable "linux_vms" {
     enable_availability_set                   = optional(bool, false)
     boot_diagnostics_enabled                  = optional(bool, true)
     boot_diagnostics_storage_account_sequence = optional(number, null)
-    enable_azure_monitor_agent                = optional(bool, false)
     auto_shutdown_enabled                     = optional(bool, false)
     auto_shutdown_time                        = optional(string, "2000")
     auto_shutdown_timezone                    = optional(string, "UTC")
@@ -158,6 +221,11 @@ variable "linux_vms" {
     recovery_vault_name                       = optional(string, "")
     recovery_vault_resource_group             = optional(string)
     backup_policy_id                          = optional(string)
+    backup_policy_name                        = optional(string, "")
+    backup_policy_frequency                   = optional(string, "Daily")
+    backup_policy_time                        = optional(string, "23:00")
+    backup_policy_weekdays                    = optional(list(string), ["Sunday"])
+    backup_policy_retention_daily_count       = optional(number, 30)
     tags                                      = optional(map(string), {})
   }))
   description = "Linux GPU VM 部署清單（key 為邏輯名稱）。"
@@ -178,8 +246,12 @@ variable "windows_vms" {
     enable_gpu_driver_extension = optional(bool, true)
     accelerated_networking      = optional(bool, true)
     public_ip_enabled           = optional(bool, false)
+    public_ip_name              = optional(string, "")
+    nic_name                    = optional(string, "")
     public_ip_sku               = optional(string, "Standard")
     public_ip_allocation_method = optional(string, "Static")
+    private_ip_allocation       = optional(string, "Dynamic")
+    private_ip_address          = optional(string)
     data_disk_enabled           = optional(bool, false)
     data_disk_count             = optional(number, 1)
     data_disk_size_gb           = optional(number, 128)
@@ -198,7 +270,6 @@ variable "windows_vms" {
     enable_availability_set                   = optional(bool, false)
     boot_diagnostics_enabled                  = optional(bool, true)
     boot_diagnostics_storage_account_sequence = optional(number, null)
-    enable_azure_monitor_agent                = optional(bool, false)
     auto_shutdown_enabled                     = optional(bool, false)
     auto_shutdown_time                        = optional(string, "2000")
     auto_shutdown_timezone                    = optional(string, "UTC")
@@ -206,6 +277,11 @@ variable "windows_vms" {
     recovery_vault_name                       = optional(string, "")
     recovery_vault_resource_group             = optional(string)
     backup_policy_id                          = optional(string)
+    backup_policy_name                        = optional(string, "")
+    backup_policy_frequency                   = optional(string, "Daily")
+    backup_policy_time                        = optional(string, "23:00")
+    backup_policy_weekdays                    = optional(list(string), ["Sunday"])
+    backup_policy_retention_daily_count       = optional(number, 30)
     tags                                      = optional(map(string), {})
   }))
   description = "Windows GPU VM 部署清單（key 為邏輯名稱）。"

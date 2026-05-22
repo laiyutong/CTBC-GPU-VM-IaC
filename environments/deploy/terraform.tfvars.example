@@ -15,8 +15,8 @@
 subscription_id = "00000000-0000-0000-0000-000000000000" # 必填：目標 Subscription ID
 
 existing_resource_group_name = "rg-gpu-example"   # 必填：VM 部署所在 Resource Group
-existing_vnet_name           = "vnet-gpu-example" # 必填：既有 VNet 名稱
 existing_vnet_resource_group = "rg-network-example" # 必填：VNet 所在 RG（可與 VM RG 相同）
+existing_vnet_name           = "vnet-gpu-example" # 必填：既有 VNet 名稱
 existing_subnet_name         = "snet-gpu-workload" # 必填：VM NIC 連接的 Subnet
 
 # 必填：VM、Storage、RSV 等資源部署之 Azure Region（須與 Subnet／VNet 所在 region 一致）
@@ -44,6 +44,12 @@ backup_recovery_vault_mode             = "per_vm_stack" # per_vm_stack | shared
 shared_recovery_vault_name             = ""           # 留空則 ctbc-jpe-shared-vm-rsv-XX
 shared_recovery_vault_sequence         = 1
 shared_recovery_vault_resource_group   = null         # 留空 = VM 所在 RG
+# backup_recovery_vault_mode = shared 時，共用備份原則排程（未填 backup_policy_id 才會建立）
+# shared_backup_policy_name                  = ""        # 留空則 {共用 RSV 名稱}-vm-policy
+# shared_backup_policy_frequency             = "Daily"   # Daily | Weekly
+# shared_backup_policy_time                  = "23:00"   # HH:mm
+# shared_backup_policy_weekdays              = ["Sunday"] # Weekly 時必填
+# shared_backup_policy_retention_daily_count = 30
 
 # -----------------------------------------------------------------------------
 # Linux GPU VM（azurerm_linux_virtual_machine）
@@ -108,11 +114,17 @@ linux_vms = {
     # --- 網路 ---
     accelerated_networking = true # 選填：NIC 加速網路（SR-IOV），須 SKU 支援
 
-    # Public IP（選用，預設不建立）
-    public_ip_enabled           = false   # 選填：true 時每部 VM 建立一個 Public IP 並綁定 NIC
-    public_ip_sku               = "Standard" # 選填：Standard 或 Basic
-    public_ip_allocation_method = "Static"   # 選填：Static 或 Dynamic
+    # Public IP（選用，預設不建立；對外連線請改 true 或改用 scripts/bash 或 scripts/powershell）
+    public_ip_enabled           = false   # 預設 false；true 時每部 VM 建立 Public IP 並綁定 NIC
+    # public_ip_name            = ""      # 留空則 ctbc-jpe-gpu-linux-vm-01-pip（與 vm_name 序號一致）
+    # public_ip_sku               = "Standard" # public_ip_enabled = true 時：Standard 或 Basic
+    # public_ip_allocation_method = "Static"   # public_ip_enabled = true 時：Static 或 Dynamic
+    # nic_name                  = ""      # 留空則 ctbc-jpe-gpu-linux-vm-01-nic
     # 啟用 Public IP 後可執行：terraform output linux_public_ip_addresses
+
+    # Private IP（NIC 內部 IP）
+    private_ip_allocation = "Dynamic" # 選填：Dynamic 或 Static
+    # private_ip_address  = "10.0.1.10" # Static 時必填；須在 Subnet 範圍內且未被占用（目前僅支援 vm_count = 1）
 
     # --- GPU ---
     enable_gpu_driver_extension = true # 選填：NvidiaGpuDriverLinux Extension
@@ -124,7 +136,6 @@ linux_vms = {
     # --- 監控與診斷 ---
     boot_diagnostics_enabled   = true # 選填：啟用開機診斷
     # boot_diagnostics_storage_account_sequence = 1 # 選填：per_vm_stack 時專用 SA 序號（預設依 map key 排序自動編）；shared 模式時忽略
-    enable_azure_monitor_agent = false # 選填：AzureMonitorLinuxAgent
 
     # --- 身分與 RBAC ---
     # identity_type              = null # 選填：SystemAssigned、UserAssigned 等；null 表示不啟用
@@ -138,10 +149,16 @@ linux_vms = {
     auto_shutdown_time     = "2000" # 選填：HHmm（24 小時制）
     auto_shutdown_timezone = "UTC"  # 選填
 
-    # --- 備份（預設關閉；backup_enabled = true 時自動建立 RSV + 預設 VM 備份原則）---
+    # --- 備份（預設關閉；backup_enabled = true 且未填 backup_policy_id 時自動建立 RSV + VM 備份原則）---
     backup_enabled = false
     # recovery_vault_name           = "" # 選填；留空則 {vm_name}-rsv
     # recovery_vault_resource_group = null # 選填；留空則用 existing_resource_group_name
+    # backup_policy_id              = "/subscriptions/.../backupPolicies/..." # 選填：使用既有原則時必填
+    # backup_policy_name            = ""        # 選填；留空則 {recovery_vault_name}-vm-policy
+    backup_policy_frequency             = "Daily"   # 選填：Daily | Weekly（模組自建原則時）
+    backup_policy_time                  = "23:00"   # 選填：HH:mm
+    # backup_policy_weekdays            = ["Sunday"] # Weekly 時使用
+    backup_policy_retention_daily_count = 30        # 選填：每日還原點保留天數
 
     # --- 標籤 ---
     tags = {} # 選填：與 default_tags 合併
@@ -185,8 +202,14 @@ windows_vms = {
 
     # Public IP（選用，預設不建立）
     public_ip_enabled           = false
-    public_ip_sku               = "Standard"
-    public_ip_allocation_method = "Static"
+    # public_ip_name            = ""
+    # public_ip_sku               = "Standard"
+    # public_ip_allocation_method = "Static"
+    # nic_name                  = ""
+
+    # Private IP（NIC 內部 IP）
+    private_ip_allocation = "Dynamic"
+    # private_ip_address  = "10.0.1.11"
 
     # --- GPU ---
     enable_gpu_driver_extension = true
@@ -198,7 +221,6 @@ windows_vms = {
     # --- 監控與診斷 ---
     boot_diagnostics_enabled   = true
     # boot_diagnostics_storage_account_sequence = 1 # 選填：per_vm_stack 時 Windows 專用 SA 序號
-    enable_azure_monitor_agent = false
 
     # --- 身分與 RBAC ---
     # identity_type              = null
@@ -211,8 +233,12 @@ windows_vms = {
     auto_shutdown_time     = "2000"
     auto_shutdown_timezone = "UTC"
 
-    # --- 備份（backup_enabled = true 時自動建立 RSV + 預設 VM 備份原則）---
+    # --- 備份 ---
     backup_enabled = false
+    # backup_policy_name            = ""
+    backup_policy_frequency             = "Daily"
+    backup_policy_time                  = "23:00"
+    backup_policy_retention_daily_count = 30
 
     tags = {}
   }

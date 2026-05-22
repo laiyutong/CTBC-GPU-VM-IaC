@@ -102,6 +102,59 @@ variable "public_ip_allocation_method" {
   }
 }
 
+variable "public_ip_name" {
+  type        = string
+  description = "Public IP 資源名稱；留空則每部 VM 為 {vm_name}-01-pip、{vm_name}-02-pip…（與 VM 序號一致）。自訂名稱僅支援 vm_count = 1。"
+  default     = ""
+
+  validation {
+    condition     = trimspace(var.public_ip_name) == "" || var.vm_count == 1
+    error_message = "public_ip_name 自訂名稱僅支援 vm_count = 1；多部 VM 請留空以使用 {vm_name}-01-pip 格式。"
+  }
+}
+
+variable "nic_name" {
+  type        = string
+  description = "NIC 資源名稱；留空則每部 VM 為 {vm_name}-01-nic、{vm_name}-02-nic…（與 VM 序號一致）。自訂名稱僅支援 vm_count = 1。"
+  default     = ""
+
+  validation {
+    condition     = trimspace(var.nic_name) == "" || var.vm_count == 1
+    error_message = "nic_name 自訂名稱僅支援 vm_count = 1；多部 VM 請留空以使用 {vm_name}-01-nic 格式。"
+  }
+}
+
+variable "private_ip_allocation" {
+  type        = string
+  description = "NIC 私人 IP 配置方式：Dynamic 或 Static。"
+  default     = "Dynamic"
+
+  validation {
+    condition     = contains(["Dynamic", "Static"], var.private_ip_allocation)
+    error_message = "private_ip_allocation 必須為 Dynamic 或 Static。"
+  }
+
+  validation {
+    condition     = var.private_ip_allocation != "Static" || var.vm_count == 1
+    error_message = "Static 私人 IP 目前僅支援 vm_count = 1；多部 VM 請使用 Dynamic 或分開部署。"
+  }
+}
+
+variable "private_ip_address" {
+  type        = string
+  description = "private_ip_allocation = Static 時指定的私人 IP（須在 Subnet 範圍內且未被占用）。"
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = (
+      var.private_ip_allocation != "Static" ||
+      (var.private_ip_address != null && trimspace(var.private_ip_address) != "")
+    )
+    error_message = "private_ip_allocation = Static 時必須設定 private_ip_address。"
+  }
+}
+
 variable "data_disk_enabled" {
   type    = bool
   default = false
@@ -222,11 +275,6 @@ variable "boot_diagnostics_storage_account_sequence" {
   }
 }
 
-variable "enable_azure_monitor_agent" {
-  type    = bool
-  default = false
-}
-
 variable "auto_shutdown_enabled" {
   type    = bool
   default = false
@@ -262,9 +310,64 @@ variable "recovery_vault_resource_group" {
 
 variable "backup_policy_id" {
   type        = string
-  description = "既有 VM 備份原則資源 ID。留空則於新建的 Vault 內建立預設每日備份原則。"
+  description = "既有 VM 備份原則資源 ID。留空則於新建的 Vault 內建立 VM 備份原則（排程由下列 backup_policy_* 變數決定）。"
   default     = null
   nullable    = true
+}
+
+variable "backup_policy_name" {
+  type        = string
+  description = "模組自建 VM 備份原則名稱；留空則為 {recovery_vault_name}-vm-policy。"
+  default     = ""
+}
+
+variable "backup_policy_frequency" {
+  type        = string
+  description = "模組自建備份原則之排程頻率：Daily 或 Weekly。"
+  default     = "Daily"
+
+  validation {
+    condition     = contains(["Daily", "Weekly"], var.backup_policy_frequency)
+    error_message = "backup_policy_frequency 必須為 Daily 或 Weekly。"
+  }
+}
+
+variable "backup_policy_time" {
+  type        = string
+  description = "模組自建備份原則之每日／每週執行時間（24 小時制 HH:mm，例如 23:00）。"
+  default     = "23:00"
+
+  validation {
+    condition     = can(regex("^([01][0-9]|2[0-3]):[0-5][0-9]$", var.backup_policy_time))
+    error_message = "backup_policy_time 須為 HH:mm 格式（00:00～23:59）。"
+  }
+}
+
+variable "backup_policy_weekdays" {
+  type        = list(string)
+  description = "backup_policy_frequency = Weekly 時的備份星期（例如 Sunday、Monday）。"
+  default     = ["Sunday"]
+
+  validation {
+    condition = alltrue([
+      for d in var.backup_policy_weekdays : contains(
+        ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+        d
+      )
+    ])
+    error_message = "backup_policy_weekdays 須為 Sunday～Saturday 其中之一或多個。"
+  }
+}
+
+variable "backup_policy_retention_daily_count" {
+  type        = number
+  description = "模組自建備份原則之每日還原點保留天數。"
+  default     = 30
+
+  validation {
+    condition     = var.backup_policy_retention_daily_count >= 1 && var.backup_policy_retention_daily_count <= 9999
+    error_message = "backup_policy_retention_daily_count 必須介於 1 與 9999。"
+  }
 }
 
 variable "tags" {

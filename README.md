@@ -6,28 +6,34 @@
 
 可安裝 **NVIDIA GPU VM Extension**；可選開機診斷設定（Storage Account）、備份（Recovery Services Vault）、Public IP、Data Disk、加速網路與多種 Linux 登入方式（密碼／SSH）。
 
-Azure Resource Group、VNet、Subnet 為預建，本專案僅以 `data` 引用；**不包含** NSG、Azure Firewall 與網路連線測試（連線驗證請見 `scripts/README-attach-nsg-connect-test.md`）。
+Azure Resource Group、VNet、Subnet 為預建，本專案僅以 `data` 引用；**不包含** NSG、Azure Firewall 與網路連線測試（連線驗證請見 [`scripts/README.md`](scripts/README.md)）。
 
 ## 目錄結構
 
 ```
 ├── modules/
-│   ├── vm-linux/               # Linux VM
-│   ├── vm-windows/             # Windows VM
-│   └── gpu-extension/          # NVIDIA GPU Driver Extension
+│   ├── vm-linux/                    # Linux VM
+│   ├── vm-windows/                  # Windows VM
+│   └── gpu-extension/               # NVIDIA GPU Driver Extension
 ├── environments/
-│   └── deploy/                 # 部署根目錄（單一 state）
-│       ├── providers.tf        # Provider 版本
-│       ├── data.tf             # 既有 RG／VNet／Subnet
-│       ├── main.tf             # 主程式架構：調用子模組，動態配置共用診斷 SA 與備份 RSV
-│       ├── locals.tf           # 區域變數計算
-│       ├── variables.tf        # 輸入變數
-│       ├── outputs.tf          # 輸出參數定義
-│       └── terraform.tfvars.example  # 參數範本（複製為 .tfvars 後填入實際值）
-└── scripts/                      # 部署後連線驗證（非 Terraform）
-    ├── README-attach-nsg-connect-test.md  # 腳本說明
-    ├── attach-nsg-connect-test.sh.txt     # Bash 範本（複製為 .sh 後填入實際值）
-    └── attach-nsg-connect-test.ps1.txt    # PowerShell 範本（複製為 .ps1 後填入實際值）
+│   └── deploy/                      # 部署根目錄（單一 state）
+│       ├── providers.tf
+│       ├── data.tf                  # 既有 RG／VNet／Subnet
+│       ├── main.tf
+│       ├── locals.tf
+│       ├── variables.tf
+│       ├── outputs.tf
+│       └── terraform.tfvars.example # 複製為 terraform.tfvars 後填入（勿提交版控）
+└── scripts/                         # 部署後連線驗證（非 Terraform）
+    ├── README.md
+    ├── bash/                        # macOS / Linux
+    │   ├── README.md
+    │   ├── nsg-connect-test.sh / .sh.txt
+    │   └── public-ip-nsg-connect-test.sh / .sh.txt
+    └── powershell/                  # Windows
+        ├── README.md
+        ├── nsg-connect-test.ps1 / .ps1.txt
+        └── public-ip-nsg-connect-test.ps1 / .ps1.txt
 ```
 
 ## 部署
@@ -66,8 +72,8 @@ terraform output -json linux_ssh_private_key_pem
 
 根變數 `backup_recovery_vault_mode`（與開機診斷概念相同，寫在 `terraform.tfvars` 根層）：
 
-- `per_vm_stack`（預設）：每個 `linux_vms`／`windows_vms` 條目在 `backup_enabled = true` 且未指定既有 `backup_policy_id` 時，於子模組內自建 RSV 與預設 VM 備份原則。
-- `shared`：在 `environments/deploy/main.tf` 建立單一共用 RSV 與一條預設 VM 備份原則；所有符合條件且啟用備份的組別共用（條件：根 `backup_policy_id` 未設定，且該組未設定 `backup_policy_id`）。可選 `shared_recovery_vault_name`（留空則 `ctbc-jpe-shared-vm-rsv-XX`）、`shared_recovery_vault_sequence`、`shared_recovery_vault_resource_group`。
+- `per_vm_stack`（預設）：每個 `linux_vms`／`windows_vms` 條目在 `backup_enabled = true` 且未指定既有 `backup_policy_id` 時，於子模組內自建 RSV 與 VM 備份原則；排程可在各組 tfvars 設定 `backup_policy_name`（留空則 `{recovery_vault_name}-vm-policy`）、`backup_policy_frequency`、`backup_policy_time`、`backup_policy_retention_daily_count`（及 Weekly 時的 `backup_policy_weekdays`）。
+- `shared`：在 `environments/deploy/main.tf` 建立單一共用 RSV 與一條 VM 備份原則；排程由根層 `shared_backup_policy_*` 變數設定。可選 `shared_recovery_vault_name`（留空則 `ctbc-jpe-shared-vm-rsv-XX`）、`shared_recovery_vault_sequence`、`shared_recovery_vault_resource_group`。
 
 ## 連線 VM
 

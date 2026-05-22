@@ -40,7 +40,7 @@ resource "azurerm_availability_set" "main" {
 resource "azurerm_public_ip" "main" {
   count = var.public_ip_enabled ? var.vm_count : 0
 
-  name                = "${local.vm_names[count.index]}-pip"
+  name                = local.public_ip_names[count.index]
   location            = var.location
   resource_group_name = var.resource_group_name
   allocation_method   = var.public_ip_allocation_method
@@ -53,14 +53,15 @@ resource "azurerm_public_ip" "main" {
 resource "azurerm_network_interface" "main" {
   count = var.vm_count
 
-  name                = "${local.vm_names[count.index]}-nic"
+  name                = local.nic_names[count.index]
   location            = var.location
   resource_group_name = var.resource_group_name
 
   ip_configuration {
     name                          = "internal"
     subnet_id                     = var.subnet_id
-    private_ip_address_allocation = "Dynamic"
+    private_ip_address_allocation = var.private_ip_allocation
+    private_ip_address              = var.private_ip_allocation == "Static" ? var.private_ip_address : null
     public_ip_address_id          = var.public_ip_enabled ? azurerm_public_ip.main[count.index].id : null
   }
 
@@ -193,19 +194,6 @@ resource "azurerm_virtual_machine_extension" "aad" {
   depends_on = [azurerm_windows_virtual_machine.main]
 }
 
-resource "azurerm_virtual_machine_extension" "ama" {
-  count = var.enable_azure_monitor_agent ? var.vm_count : 0
-
-  name                       = "AzureMonitorWindowsAgent"
-  virtual_machine_id         = azurerm_windows_virtual_machine.main[count.index].id
-  publisher                  = "Microsoft.Azure.Monitor"
-  type                       = "AzureMonitorWindowsAgent"
-  type_handler_version       = "1.0"
-  auto_upgrade_minor_version = true
-
-  depends_on = [azurerm_windows_virtual_machine.main]
-}
-
 resource "azurerm_dev_test_global_vm_shutdown_schedule" "shutdown" {
   count = var.auto_shutdown_enabled ? var.vm_count : 0
 
@@ -246,8 +234,6 @@ resource "azurerm_recovery_services_vault" "main" {
   resource_group_name = local.recovery_vault_rg
   sku                 = "Standard"
 
-  soft_delete_enabled = true
-
   tags = var.tags
 }
 
@@ -259,12 +245,13 @@ resource "azurerm_backup_policy_vm" "main" {
   recovery_vault_name = azurerm_recovery_services_vault.main[0].name
 
   backup {
-    frequency = "Daily"
-    time      = "23:00"
+    frequency = var.backup_policy_frequency
+    time      = var.backup_policy_time
+    weekdays  = var.backup_policy_frequency == "Weekly" ? var.backup_policy_weekdays : null
   }
 
   retention_daily {
-    count = 30
+    count = var.backup_policy_retention_daily_count
   }
 
   depends_on = [azurerm_recovery_services_vault.main]

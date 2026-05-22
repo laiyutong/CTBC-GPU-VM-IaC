@@ -1,9 +1,9 @@
 #Requires -Version 5.1
 #
-# [Sanitized example] Logic matches attach-nsg-connect-test.ps1; placeholders only — safe for version control.
-# To run: copy to attach-nsg-connect-test.local.ps1, fill RG/VM/credentials, then:
+# [Sanitized example] Logic matches nsg-connect-test.ps1; placeholders only — safe for version control.
+# To run: copy to nsg-connect-test.local.ps1, fill RG/VM/credentials, then:
 #   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-#   .\attach-nsg-connect-test.local.ps1
+#   .\nsg-connect-test.local.ps1
 #
 <#
 .SYNOPSIS
@@ -14,15 +14,15 @@
   - Adds inbound rule allow-mgmt-port (TCP 22 or 3389)
   - Binds NSG to the VM's first NIC, runs TCP and optional login checks
   - On exit: restores prior NIC NSG binding; deletes NSG only if created by this run
-  See README-attach-nsg-connect-test.md
+  See scripts/powershell/README.md (VM must already have a public IP)
  
 .NOTES
   Windows execution (from repo scripts folder):
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-    .\attach-nsg-connect-test.ps1
+    .\nsg-connect-test.ps1
  
   Or:
-    powershell -ExecutionPolicy Bypass -File .\attach-nsg-connect-test.ps1
+    powershell -ExecutionPolicy Bypass -File .\nsg-connect-test.ps1
  
     Windows RDP password check requires xfreerdp/wfreerdp (FreeRDP 3, +auth-only).
     Current validated Windows install path is Chocolatey:
@@ -81,16 +81,16 @@ $script:RuleName = 'allow-mgmt-port'
 $script:RdpLastErr = ''
  
 function Write-Info([string] $Message) {
-    Write-Host "[attach-nsg-connect-test] $Message" -ForegroundColor Cyan
+    Write-Host "[nsg-connect-test] $Message" -ForegroundColor Cyan
 }
  
 function Write-Fail([string] $Message) {
-    Write-Host "[attach-nsg-connect-test] ERROR: $Message" -ForegroundColor Red
+    Write-Host "[nsg-connect-test] ERROR: $Message" -ForegroundColor Red
     exit 1
 }
  
 function Write-VmFail([string] $VmName, [string] $Message) {
-    Write-Host "[attach-nsg-connect-test] [$VmName] ERROR: $Message" -ForegroundColor Red
+    Write-Host "[nsg-connect-test] [$VmName] ERROR: $Message" -ForegroundColor Red
 }
  
 function Test-Prerequisites {
@@ -280,7 +280,7 @@ function Test-SshKeyEchoOk {
         return @{ Ok = $false; Code = 5; Message = 'ssh not found (enable OpenSSH Client on Windows 10+)' }
     }
  
-    $knownHosts = Join-Path $env:TEMP ("attach-nsg-ssh-kh-{0}" -f [Guid]::NewGuid().ToString('N'))
+    $knownHosts = Join-Path $env:TEMP ("nsg-connect-ssh-kh-{0}" -f [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType File -Path $knownHosts -Force | Out-Null
     $prevEa = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
@@ -556,7 +556,7 @@ function Invoke-OneVm {
                     Write-Info "[$VmName] RDP password auth: success ($rdpClient)"
                 }
                 elseif ($rdpRc -eq 2) {
-                    Write-VmFail $VmName 'RDP password auth: failed (FreeRDP tools not installed). When password is set, RDP auth is required. Windows: choco install freerdp (Chocolatey; winget package unavailable). macOS: brew install freerdp. See README-attach-nsg-connect-test.md.'
+                    Write-VmFail $VmName 'RDP password auth: failed (FreeRDP tools not installed). When password is set, RDP auth is required. Windows: choco install freerdp (Chocolatey; winget package unavailable). macOS: brew install freerdp. See scripts/powershell/README.md.'
                     return $false
                 }
                 else {

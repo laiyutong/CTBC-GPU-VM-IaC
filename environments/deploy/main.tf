@@ -27,25 +27,24 @@ resource "azurerm_recovery_services_vault" "shared_backup" {
   resource_group_name = local.shared_recovery_vault_rg_effective
   sku                 = "Standard"
 
-  soft_delete_enabled = true
-
   tags = var.default_tags
 }
 
 resource "azurerm_backup_policy_vm" "shared_backup" {
   count = var.backup_recovery_vault_mode == "shared" && local.any_shared_backup_enabled ? 1 : 0
 
-  name                = "${azurerm_recovery_services_vault.shared_backup[0].name}-vm-policy"
+  name                = local.shared_backup_policy_name_effective
   resource_group_name = local.shared_recovery_vault_rg_effective
   recovery_vault_name = azurerm_recovery_services_vault.shared_backup[0].name
 
   backup {
-    frequency = "Daily"
-    time      = "23:00"
+    frequency = var.shared_backup_policy_frequency
+    time      = var.shared_backup_policy_time
+    weekdays  = var.shared_backup_policy_frequency == "Weekly" ? var.shared_backup_policy_weekdays : null
   }
 
   retention_daily {
-    count = 30
+    count = var.shared_backup_policy_retention_daily_count
   }
 
   depends_on = [azurerm_recovery_services_vault.shared_backup]
@@ -70,8 +69,12 @@ module "linux" {
   source_image_version         = each.value.source_image_version
   accelerated_networking       = each.value.accelerated_networking
   public_ip_enabled            = each.value.public_ip_enabled
+  public_ip_name               = each.value.public_ip_name
+  nic_name                     = each.value.nic_name
   public_ip_sku                = each.value.public_ip_sku
   public_ip_allocation_method  = each.value.public_ip_allocation_method
+  private_ip_allocation        = each.value.private_ip_allocation
+  private_ip_address           = try(each.value.private_ip_address, null)
   data_disk_enabled            = each.value.data_disk_enabled
   data_disk_count              = each.value.data_disk_count
   data_disk_size_gb            = each.value.data_disk_size_gb
@@ -100,15 +103,19 @@ module "linux" {
     each.value.boot_diagnostics_storage_account_sequence,
     local.linux_boot_diag_seq_default[each.key]
   )
-  enable_azure_monitor_agent    = each.value.enable_azure_monitor_agent
   auto_shutdown_enabled         = each.value.auto_shutdown_enabled
   auto_shutdown_time            = each.value.auto_shutdown_time
   auto_shutdown_timezone        = each.value.auto_shutdown_timezone
   backup_enabled                = each.value.backup_enabled
   recovery_vault_name           = local.linux_uses_shared_backup_rsv[each.key] ? local.shared_recovery_vault_name_effective : each.value.recovery_vault_name
   recovery_vault_resource_group = local.linux_uses_shared_backup_rsv[each.key] ? local.shared_recovery_vault_rg_effective : try(each.value.recovery_vault_resource_group, null)
-  backup_policy_id              = local.linux_backup_policy_id_for_module[each.key]
-  tags                          = local.linux_vm_tags[each.key]
+  backup_policy_id                    = local.linux_backup_policy_id_for_module[each.key]
+  backup_policy_name                  = each.value.backup_policy_name
+  backup_policy_frequency             = each.value.backup_policy_frequency
+  backup_policy_time                  = each.value.backup_policy_time
+  backup_policy_weekdays              = each.value.backup_policy_weekdays
+  backup_policy_retention_daily_count = each.value.backup_policy_retention_daily_count
+  tags                                = local.linux_vm_tags[each.key]
 }
 
 module "windows" {
@@ -130,8 +137,12 @@ module "windows" {
   source_image_version        = each.value.source_image_version
   accelerated_networking      = each.value.accelerated_networking
   public_ip_enabled           = each.value.public_ip_enabled
+  public_ip_name              = each.value.public_ip_name
+  nic_name                    = each.value.nic_name
   public_ip_sku               = each.value.public_ip_sku
   public_ip_allocation_method = each.value.public_ip_allocation_method
+  private_ip_allocation       = each.value.private_ip_allocation
+  private_ip_address          = try(each.value.private_ip_address, null)
   data_disk_enabled           = each.value.data_disk_enabled
   data_disk_count             = each.value.data_disk_count
   data_disk_size_gb           = each.value.data_disk_size_gb
@@ -153,15 +164,19 @@ module "windows" {
     each.value.boot_diagnostics_storage_account_sequence,
     local.windows_boot_diag_seq_default[each.key]
   )
-  enable_azure_monitor_agent    = each.value.enable_azure_monitor_agent
   auto_shutdown_enabled         = each.value.auto_shutdown_enabled
   auto_shutdown_time            = each.value.auto_shutdown_time
   auto_shutdown_timezone        = each.value.auto_shutdown_timezone
   backup_enabled                = each.value.backup_enabled
   recovery_vault_name           = local.windows_uses_shared_backup_rsv[each.key] ? local.shared_recovery_vault_name_effective : each.value.recovery_vault_name
   recovery_vault_resource_group = local.windows_uses_shared_backup_rsv[each.key] ? local.shared_recovery_vault_rg_effective : try(each.value.recovery_vault_resource_group, null)
-  backup_policy_id              = local.windows_backup_policy_id_for_module[each.key]
-  tags                          = local.windows_vm_tags[each.key]
+  backup_policy_id                    = local.windows_backup_policy_id_for_module[each.key]
+  backup_policy_name                  = each.value.backup_policy_name
+  backup_policy_frequency             = each.value.backup_policy_frequency
+  backup_policy_time                  = each.value.backup_policy_time
+  backup_policy_weekdays              = each.value.backup_policy_weekdays
+  backup_policy_retention_daily_count = each.value.backup_policy_retention_daily_count
+  tags                                = local.windows_vm_tags[each.key]
 }
 
 module "linux_gpu_extension" {

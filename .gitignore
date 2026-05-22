@@ -14,11 +14,13 @@ terraform.rc
 environments/**/terraform.tfvars
 !environments/**/terraform.tfvars.example
 
-# NSG 連線測試腳本（含真實 RG/VM/密碼）；版控請用 *.txt 範例或複製為 .local.* 後填入
-scripts/attach-nsg-connect-test.sh
-scripts/attach-nsg-connect-test.ps1
-scripts/attach-nsg-connect-test.local.sh
-scripts/attach-nsg-connect-test.local.ps1
+# 連線測試腳本（含真實 RG/VM/密碼）；版控請用 *.txt 範例或複製為 .local.* 後填入
+scripts/bash/nsg-connect-test.sh
+scripts/bash/public-ip-nsg-connect-test.sh
+scripts/bash/*.local.sh
+scripts/powershell/nsg-connect-test.ps1
+scripts/powershell/public-ip-nsg-connect-test.ps1
+scripts/powershell/*.local.ps1
 
 # 本機私鑰（terraform output / 測試用）
 keys/

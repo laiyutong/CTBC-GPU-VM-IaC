@@ -6,6 +6,10 @@ locals {
 
   shared_recovery_vault_name_effective = trimspace(var.shared_recovery_vault_name) != "" ? trimspace(var.shared_recovery_vault_name) : format("ctbc-jpe-shared-vm-rsv-%02d", var.shared_recovery_vault_sequence)
 
+  shared_backup_policy_name_effective = (
+    trimspace(var.shared_backup_policy_name) != "" ? trimspace(var.shared_backup_policy_name) : "${local.shared_recovery_vault_name_effective}-vm-policy"
+  )
+
   # 根層 backup_policy_id：有填且非空白才視為「使用既有原則」（否則與 null 同等）
   root_backup_policy_id_effective = (
     var.backup_policy_id != null && length(trimspace(var.backup_policy_id)) > 0 ? trimspace(var.backup_policy_id) : null
